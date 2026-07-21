@@ -1,0 +1,17 @@
+name: Hello
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  greet:
+    runs-on: ubuntu_latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Hello ${{ github.actor}}!"
+  review:
+    runs-on: ubuntu_latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "reviewing ${{ github.event.pull_request.title}}"
