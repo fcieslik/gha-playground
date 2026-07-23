@@ -12,7 +12,13 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_ACCOUNT_ID: "427047664719"
+  AWS_REGION: us-east-1
+  S3_BUCKET: my-frontend-app-assets-1
+  SITE_URL: d26gkersxsxx1f.cloudfront.net
 
 jobs:
   checks:
@@ -50,15 +56,28 @@ jobs:
         with:
           name: build
           path: dist
-      - run: grep "Deployed by GitHub Actions" dist/index.html
-      - run: 'echo "SIMULATION: would sync dist/ to S3 here (lesson 6)"'
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+
+      - name: Show machine identity
+        run: aws sts get-caller-identity
+
+      - name: Deploy tested artifact
+        run: aws s3 sync dist/ "s3://$S3_BUCKET/" --delete
+
       - name: Report
         env:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           {
-            echo "### Simulated deploy"
+            echo "### AWS S3 bucket deploy"
             echo "- **Commit:** ${{ github.sha }}"
             echo "- **Message:** $COMMIT_MSG"
+            echo "- **Deployed to:** $SITE_URL"
             echo "- **Files in dist/:** $(find dist -type f | wc -l)"
           } >> "$GITHUB_STEP_SUMMARY"
