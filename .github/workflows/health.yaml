@@ -39,6 +39,8 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No actions/checkout here, so gh can't infer the repo from a git remote.
+          GH_REPO: ${{ github.repository }}
           STATUS: ${{ steps.check.outputs.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TITLE: "Site health check failed"
