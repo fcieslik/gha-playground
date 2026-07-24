@@ -1,0 +1,56 @@
+name: Healthcheck
+
+on:
+  schedule:
+    # UTC only — GitHub does not support a timezone key.
+    - cron: "0 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Target URL to check"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  SITE_URL: ${{ inputs.target_url || 'd26gkersxsxx1f.cloudfront.net' }}
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check website health
+        id: check
+        run: |
+          # curl still writes %{http_code} (000) on connection failure, so swallow its exit code.
+          status=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "https://$SITE_URL" || true)
+          echo "status=${status:-000}" >> "$GITHUB_OUTPUT"
+          if [ "$status" != "200" ]; then
+            echo "Website is down! HTTP status: $status"
+            exit 1
+          fi
+          echo "Website is up! HTTP status: $status"
+
+      - name: Open failure issue if website is down
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "Site health check failed"
+        run: |
+          # Don't file a duplicate while an outage issue is still open.
+          existing=$(gh issue list --state open --search "$TITLE in:title" --json number --jq 'length')
+          if [ "$existing" != "0" ]; then
+            echo "An open health check issue already exists; skipping."
+            exit 0
+          fi
+
+          body=$(printf 'The site health check failed.\n\n- URL: `https://%s`\n- HTTP status: `%s`\n- Run: %s' \
+            "$SITE_URL" "$STATUS" "$RUN_URL")
+
+          gh issue create --title "$TITLE" --body "$body"
