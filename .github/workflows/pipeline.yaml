@@ -19,6 +19,7 @@ env:
   AWS_REGION: us-east-1
   S3_BUCKET: my-frontend-app-assets-1
   SITE_URL: d26gkersxsxx1f.cloudfront.net
+  CLOUDFRONT_DISTRIBUTION_ID: E9NDK1GEGISTX
 
 jobs:
   ci:
@@ -47,7 +48,14 @@ jobs:
         run: aws sts get-caller-identity
 
       - name: Deploy tested artifact
-        run: aws s3 sync dist/ "s3://$S3_BUCKET/" --delete
+        run: aws s3 sync dist/ "s3://$S3_BUCKET/" --delete --exact-timestamps
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths '/*' \
+            --caller-reference "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 
       - name: Report deployment
         uses: ./.github/actions/deploy-summary
@@ -56,3 +64,6 @@ jobs:
           commit-message: ${{ github.event.head_commit.message || 'No commit message' }}
           site-directory: dist
           target: ${{ env.SITE_URL }}
+
+      - name: Verify live state
+        run: curl --fail --silent --show-error "https://$SITE_URL" | grep --fixed-strings "Deployed by GitHub Actions"
