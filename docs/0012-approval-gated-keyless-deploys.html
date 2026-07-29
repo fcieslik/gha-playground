@@ -1,0 +1,452 @@
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lesson 12: Approval-Gated, Keyless Deploys</title>
+<link rel="stylesheet" href="../assets/course.css" />
+<style>
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.95em;
+  }
+  th,
+  td {
+    text-align: left;
+    padding: 0.45rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    font-variant: small-caps;
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .boundary {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    line-height: 1.4;
+    white-space: pre;
+  }
+  .danger {
+    border-left: 3px solid var(--accent);
+    padding-left: 1rem;
+  }
+</style>
+<main>
+  <h1>Approval-Gated, Keyless Deploys</h1>
+  <p class="lesson-meta">
+    Lesson 12 · combines planned lessons 15–16 · ~90–120 min · gate production
+    with a human decision, replace stored AWS keys with a short-lived OIDC role,
+    then delete the keys
+  </p>
+  <p class="lesson-meta">
+    Prerequisite:
+    <a href="0011-private-cloudfront-delivery.html">lesson 11</a> complete:
+    CloudFront serves the site over HTTPS, direct S3 reads fail, and the
+    post-merge deploy still authenticates with the temporary IAM-user secrets
+    from lesson 7.
+  </p>
+
+  <p>
+    Today you remove two different risks. First, a merge should not silently
+    become a production release: a GitHub <strong>Environment</strong> will
+    pause the deploy for approval. Second, a credential should not remain valid
+    forever: GitHub <strong>OIDC</strong> will prove the job's identity to AWS,
+    which returns temporary role credentials.
+  </p>
+
+  <div class="boundary">
+    merge to main │ ▼ GitHub Environment: production ── approval ──► job may
+    start │ ▼ GitHub OIDC token ── aud + exact sub ──► AWS role trust policy │ ▼
+    temporary AWS role credentials │ ▼ S3 sync → invalidation → live check
+  </div>
+
+  <p>
+    Keep the boundaries separate: the Environment
+    <strong>authorizes the release</strong>; OIDC
+    <strong>authenticates the workload</strong>; the role's permission policy
+    <strong>authorizes AWS operations</strong>. Passing one gate does not imply
+    either of the others.
+  </p>
+
+  <div class="primary-source">
+    Continue Frontend Masters’
+    <a href="https://frontendmasters.com/courses/github-actions/"
+      ><strong>Cloud CI/CD with GitHub Actions</strong></a
+    >
+    with <strong>GitHub Environments</strong> and
+    <strong>OpenID Connect</strong>. Use GitHub’s current
+    <a
+      href="https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments"
+      >environments reference</a
+    >
+    and
+    <a
+      href="https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws"
+      >AWS OIDC guide</a
+    >
+    for behavior that has changed since the recording. This repository was
+    created after 15 July 2026, so its default OIDC subject includes immutable
+    owner and repository IDs; verify the exact value against the
+    <a href="https://docs.github.com/en/actions/reference/security/oidc"
+      >OIDC claim reference</a
+    >. Keep the
+    <a href="../reference/environments-and-oidc.html"
+      >Environments &amp; OIDC reference</a
+    >
+    open.
+  </div>
+
+  <h2>Checkpoint 1 — make production wait</h2>
+
+  <p>
+    In repository Settings → Environments, create <code>dev</code> and
+    <code>production</code>. Keep <code>dev</code> unprotected for the later
+    PR-preview lesson. On <code>production</code>, allow only the
+    <code>main</code> deployment branch and add a required reviewer. If another
+    trusted person can review the scratch repository, enable
+    <strong>Prevent self-review</strong> and disable administrator bypass. If
+    you are practicing alone, allow self-review for this exercise and record
+    that this proves the mechanism—not separation of duties.
+  </p>
+
+  <p>
+    Store non-secret deployment configuration as
+    <code>production</code> environment variables: <code>AWS_ACCOUNT_ID</code>,
+    <code>AWS_REGION</code>, <code>AWS_ROLE_ARN</code>, <code>S3_BUCKET</code>,
+    <code>CLOUDFRONT_DISTRIBUTION_ID</code>, and <code>CLOUDFRONT_URL</code>.
+    The role does not exist yet, so add its planned ARN now and correct it after
+    creation if necessary.
+  </p>
+
+  <p>
+    Add the environment to the existing post-merge <code>deploy</code> job. Do
+    not put it on the reusable CI job: pull requests must still build and test
+    without production approval or AWS identity.
+  </p>
+
+  <pre><code>deploy:
+  if: github.event_name == 'push'
+  needs: ci
+  runs-on: ubuntu-latest
+  environment:
+    name: production
+    url: ${{ vars.CLOUDFRONT_URL }}
+  permissions:
+    contents: read
+  steps:
+    # existing deploy steps, still using temporary keys for this checkpoint</code></pre>
+
+  <div class="exercise">
+    <span class="exercise-label"
+      >Exercise 1 — prove the release gate before changing identity</span
+    >
+    <p>
+      Write the job edit from scratch, run <code>actionlint</code>, open a small
+      PR, and merge it through <code>ci / required</code>. On the push run,
+      inspect the deployment job before approving it. Confirm that CI completed
+      but no S3 sync or CloudFront invalidation began. Approve the deployment,
+      then confirm the existing key-authenticated deploy succeeds.
+    </p>
+    <div class="expect">
+      The run pauses at <strong>production</strong> with a review prompt.
+      Approval is recorded in GitHub’s deployment history; only then does the
+      deploy job start and the CloudFront check turn green.
+    </div>
+    <details>
+      <summary>Self-check and failure routing</summary>
+      <ul>
+        <li>
+          No pause: the job lacks <code>environment: production</code>, the
+          environment name differs by case, or no required reviewer is
+          configured.
+        </li>
+        <li>
+          Approval is impossible: self-review is blocked and no second eligible
+          reviewer exists.
+        </li>
+        <li>
+          PR CI also waits: the environment was attached to
+          <code>ci</code> instead of only <code>deploy</code>.
+        </li>
+        <li>
+          Deploy starts before approval: verify the observed AWS step belongs to
+          the same push run, not an older run.
+        </li>
+      </ul>
+    </details>
+  </div>
+
+  <h2>Checkpoint 2 — define who AWS may trust</h2>
+
+  <p>
+    In AWS IAM, add one OpenID Connect provider for
+    <code>https://token.actions.githubusercontent.com</code> with audience
+    <code>sts.amazonaws.com</code>. Then create a role named
+    <code>gha-production-deploy</code>. Attach the same narrow S3 and CloudFront
+    permissions already proven by the temporary deploy identity; do not attach
+    <code>AdministratorAccess</code>. The role has two policies with different
+    questions:
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Policy</th>
+        <th>Question it answers</th>
+        <th>Required restriction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Trust policy</td>
+        <td>Who may become this role?</td>
+        <td>
+          GitHub provider, AWS audience, exact repository +
+          <code>production</code> environment subject
+        </td>
+      </tr>
+      <tr>
+        <td>Permission policy</td>
+        <td>What may the assumed role do?</td>
+        <td>
+          Existing bucket object operations and this distribution’s invalidation
+          only
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Get the immutable owner/repository prefix from GitHub rather than guessing
+    numeric IDs:
+  </p>
+
+  <pre><code>gh api repos/{owner}/{repo} \
+  --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id):environment:production"'</code></pre>
+
+  <p>
+    Use the exact output as the <code>sub</code>. Repositories created before 15
+    July 2026 may still emit the legacy name-only form unless they opted in;
+    this playground uses the immutable form. An Environment job’s subject ends
+    in <code>environment:production</code>, not
+    <code>ref:refs/heads/main</code>. Branch eligibility belongs in the
+    Environment rule; the AWS trust binds the credential to the protected
+    Environment.
+  </p>
+
+  <pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::AWS_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:OWNER@OWNER_ID/REPO@REPO_ID:environment:production"
+        }
+      }
+    }
+  ]
+}</code></pre>
+
+  <p class="aside">
+    Use <code>StringEquals</code> for one exact subject. A wildcard such as
+    <code>repo:ORG/*</code> makes every matching repository a possible
+    credential issuer and defeats the boundary you are building.
+  </p>
+
+  <h2>Checkpoint 3 — exchange identity, then retire the key</h2>
+
+  <p>
+    Change only the deploy job’s authentication seam.
+    <code>id-token: write</code> means “allow this job to request an OIDC
+    token”; it does not grant repository writes or AWS permissions. Keep it off
+    the reusable CI job.
+  </p>
+
+  <pre><code>deploy:
+  if: github.event_name == 'push'
+  needs: ci
+  runs-on: ubuntu-latest
+  environment:
+    name: production
+    url: ${{ vars.CLOUDFRONT_URL }}
+  permissions:
+    contents: read
+    id-token: write
+  steps:
+    - uses: actions/checkout@v7
+
+    - uses: actions/download-artifact@v8
+      with:
+        name: site
+        path: dist/
+
+    - name: Configure temporary AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6.2.3
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+        aws-region: ${{ vars.AWS_REGION }}
+        allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+        role-session-name: gha-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Prove the assumed identity
+      run: aws sts get-caller-identity
+
+    # unchanged S3 sync, CloudFront invalidation, live check, and summary</code></pre>
+
+  <p>
+    The action asks GitHub for a run-bound token, calls AWS STS
+    <code>AssumeRoleWithWebIdentity</code>, and exports temporary credentials
+    for later AWS CLI steps. <code>allowed-account-ids</code> makes a
+    wrong-account assumption fail immediately. There is no
+    <code>aws-access-key-id</code> or <code>aws-secret-access-key</code> input.
+  </p>
+
+  <div class="exercise">
+    <span class="exercise-label"
+      >Exercise 2 — prove keyless, then remove the escape hatch</span
+    >
+    <ol>
+      <li>
+        Create the provider and role with the exact trust policy and the
+        existing least-privilege deploy permissions.
+      </li>
+      <li>
+        Replace the key inputs with the OIDC configuration above; run
+        <code>actionlint</code>.
+      </li>
+      <li>
+        Merge through green CI, approve production, and inspect
+        <code>get-caller-identity</code>. Its ARN must contain
+        <code>assumed-role/gha-production-deploy/</code>.
+      </li>
+      <li>Verify the CloudFront URL and direct-S3 denial still pass.</li>
+      <li>
+        Only after that proof, delete repository secrets
+        <code>AWS_ACCESS_KEY_ID</code> and <code>AWS_SECRET_ACCESS_KEY</code>,
+        then deactivate and delete the IAM user’s access key. Delete the machine
+        user too if nothing else uses it.
+      </li>
+      <li>
+        Re-run the same successful push workflow. Approve production again and
+        confirm it stays green without either secret.
+      </li>
+    </ol>
+    <div class="expect">
+      Two approved green deployments use the assumed role. The second occurs
+      after both GitHub secrets and the IAM access key are gone. PR CI has no
+      <code>id-token: write</code>, and the live CloudFront site remains
+      correct.
+    </div>
+    <details>
+      <summary>Migration safety checklist</summary>
+      <ul>
+        <li>
+          Do not delete the old key before one OIDC deployment reaches the live
+          check.
+        </li>
+        <li>
+          If STS says
+          <code>Not authorized to perform sts:AssumeRoleWithWebIdentity</code>,
+          compare the exact <code>aud</code> and immutable Environment
+          <code>sub</code>; do not widen to <code>*</code>.
+        </li>
+        <li>
+          If credentials work but deploy fails, inspect the role permission
+          policy, not its trust policy.
+        </li>
+        <li>
+          If the job never requests a token, confirm
+          <code>id-token: write</code> is on <code>deploy</code> and the
+          credentials step has <code>role-to-assume</code>.
+        </li>
+        <li>
+          If the second run still succeeds after key deletion, that is positive
+          proof only when the workflow has no static-key inputs and the AWS
+          identity is an assumed role.
+        </li>
+      </ul>
+    </details>
+  </div>
+
+  <h2>Check yourself</h2>
+
+  <div
+    class="quiz"
+    data-quiz='{"q":"Which boundary decides whether this release may begin?","options":["The production Environment approval gate","The AWS identity provider record","The role permission policy document"],"answer":0,"why":"The Environment authorizes the release. OIDC authenticates the workload, while the role permissions constrain its AWS operations."}'
+  ></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"What does id-token: write grant to the deploy job?","options":["Permission to request an OIDC token","Permission to edit repository workflow files","Permission to write every AWS resource"],"answer":0,"why":"It permits token minting only. AWS trust and permission policies separately decide role assumption and AWS capabilities."}'
+  ></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"Why does the trust subject end with environment:production?","options":["The deploy job references that Environment","The workflow pushes into that branch","The artifact uses that exact name"],"answer":0,"why":"When a job references an Environment, GitHub places that Environment context in the default subject instead of the branch context."}'
+  ></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"Which result proves the migration is complete?","options":["A green role deploy after key deletion","A green role deploy before key deletion","A paused deploy awaiting human approval"],"answer":0,"why":"The first role deploy validates the new path; repeating it after removing the old secrets and IAM access key proves no persistent-key fallback remains."}'
+  ></div>
+
+  <h2>Design question — decide, then defend</h2>
+
+  <div class="exercise">
+    <span class="exercise-label">One role or one role per environment?</span>
+    <p>
+      Your later PR previews need a dev bucket, while production uses the
+      private origin bucket and CloudFront invalidation. Choose (A) one shared
+      deploy role trusted by both environments, or (B) separate dev and
+      production roles. Name the operational cost and the blast-radius
+      consequence.
+    </p>
+    <details>
+      <summary>Model answer and rubric</summary>
+      <p>
+        <strong>Choose B: separate roles.</strong> The production role trusts
+        only the protected <code>production</code> subject and can write only
+        the production bucket plus invalidate one distribution. The dev role can
+        later trust only <code>dev</code> and write only the preview prefix. A
+        compromised or misconfigured preview job therefore cannot become a
+        production deployment.
+      </p>
+      <p>
+        The cost is two trust policies, two permission policies, two role ARNs,
+        and coordinated updates when shared deployment needs change. A shared
+        role is simpler, but its permission union lets the least-trusted path
+        inherit the largest blast radius. Full credit requires a decision, that
+        maintenance tradeoff, and a concrete statement about which resources
+        each identity can reach.
+      </p>
+    </details>
+  </div>
+
+  <p class="danger">
+    <strong>Done means zero long-lived AWS deploy credentials.</strong>
+    Disabling or ignoring the old GitHub secrets is not retirement; delete the
+    secrets and the IAM access key after the OIDC proof.
+  </p>
+
+  <div class="ask-agent">
+    Ask your teacher if approval never appears, no eligible reviewer can
+    approve, the Environment subject differs from the trust policy, STS rejects
+    role assumption, or the assumed role lacks one deploy permission. Bring the
+    job’s Environment name, exact redacted <code>aud</code>/<code>sub</code>,
+    role ARN, and first AWS error. Do not fix trust failures with wildcards.
+    Next:
+    <a href="0013-secure-pr-preview-lifecycle.html"
+      >secure PR preview creation and cleanup</a
+    >
+    using a separate dev identity.
+  </div>
+</main>
+<script src="../assets/quiz.js"></script>
