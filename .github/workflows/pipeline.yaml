@@ -59,29 +59,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Mutable entry point: same URL, new release -> must revalidate every request.
+          # Fail before any upload if an asset lacks a content hash in its name.
+          # Vite fingerprint contract: <name>-<8+ base64 hash>.<ext>.
+          if test -d "$SITE_DIR/assets" &&
+            find "$SITE_DIR/assets" -type f |
+              grep -Ev -- '-[0-9A-Za-z_-]{8,}\.[^./]+$'
+          then
+            echo "Every immutable asset needs a content hash in its filename" >&2
+            exit 1
+          fi
+
+          # 1. Bulk upload + remove keys absent from the artifact. This pass may
+          #    (re)write objects WITHOUT cache metadata, so it must run FIRST.
+          aws s3 sync "$SITE_DIR/" "s3://$S3_BUCKET/" --delete
+
+          # 2. Cache metadata is set LAST so the last writer wins, regardless of
+          #    how sync's second-granularity mtime compare decides to re-upload.
+          #    Mutable entry point: same URL, new release -> revalidate every request.
           aws s3 cp "$SITE_DIR/" "s3://$S3_BUCKET/" \
             --recursive \
             --exclude "*" \
             --include "*.html" \
             --cache-control "public,max-age=0,s-maxage=0,must-revalidate"
 
+          # Immutable assets: changed bytes produce a changed URL, so cache a year.
           if test -d "$SITE_DIR/assets"; then
-            # Vite fingerprint contract: <name>-<8+ base64 hash>.<ext>. No hash -> no year TTL.
-            if find "$SITE_DIR/assets" -type f |
-              grep -Ev -- '-[0-9A-Za-z_-]{8,}\.[^./]+$'
-            then
-              echo "Every immutable asset needs a content hash in its filename" >&2
-              exit 1
-            fi
-
             aws s3 cp "$SITE_DIR/assets/" "s3://$S3_BUCKET/assets/" \
               --recursive \
               --cache-control "public,max-age=31536000,immutable"
           fi
-
-          # Remove keys absent from the artifact (delete-only in practice).
-          aws s3 sync "$SITE_DIR/" "s3://$S3_BUCKET/" --delete
 
       - name: Revalidate the mutable entry point
         id: invalidate
@@ -98,6 +104,18 @@ jobs:
           aws cloudfront wait invalidation-completed \
             --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
             --id "$invalidation_id"
+
+      - name: Prove the freshness contract reached the origin
+        run: |
+          set -euo pipefail
+          html_cc="$(aws s3api head-object \
+            --bucket "$S3_BUCKET" --key index.html \
+            --query CacheControl --output text)"
+          echo "index.html Cache-Control: $html_cc"
+          case "$html_cc" in
+            *max-age=0*) ;;
+            *) echo "index.html is missing the zero-age policy" >&2; exit 1;;
+          esac
 
       - name: Report deployment
         uses: ./.github/actions/deploy-summary
