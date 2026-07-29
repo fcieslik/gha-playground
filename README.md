@@ -65,12 +65,12 @@ definitions on `main`, so a PR cannot edit the job that receives AWS access.
 
 **Workflows**
 
-| File | Trigger | Role |
-| --- | --- | --- |
-| `pipeline.yaml` (`Pipeline`) | `pull_request`, `push`, `dispatch` | CI on every PR; production deploy on push to `main` |
-| `ci.yaml` (`CI`, reusable) | `workflow_call` | lint, format, build, upload `build` artifact — no credentials |
-| `preview-cleanup-request.yaml` | `pull_request: closed` | inert signal (`permissions: {}`) so the trusted side can observe a close |
-| `preview-lifecycle.yaml` (`Preview lifecycle`) | `workflow_run: completed` | trusted deploy + cleanup of `previews/pr-N/` via the dev OIDC role |
+| File                                           | Trigger                            | Role                                                                     |
+| ---------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------ |
+| `pipeline.yaml` (`Pipeline`)                   | `pull_request`, `push`, `dispatch` | CI on every PR; production deploy on push to `main`                      |
+| `ci.yaml` (`CI`, reusable)                     | `workflow_call`                    | lint, format, build, upload `build` artifact — no credentials            |
+| `preview-cleanup-request.yaml`                 | `pull_request: closed`             | inert signal (`permissions: {}`) so the trusted side can observe a close |
+| `preview-lifecycle.yaml` (`Preview lifecycle`) | `workflow_run: completed`          | trusted deploy + cleanup of `previews/pr-N/` via the dev OIDC role       |
 
 **Why it is safe**
 
