@@ -1,55 +1,155 @@
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Lesson 13: Secure PR Preview Lifecycle</title>
-<link rel="stylesheet" href="../assets/course.css">
+<link rel="stylesheet" href="../assets/course.css" />
 <style>
-  table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
-  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { font-variant: small-caps; font-weight: 400; color: var(--muted); }
-  .boundary { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.1rem; overflow-x: auto; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.82em; line-height: 1.4; white-space: pre; }
-  .danger { border-left: 3px solid var(--accent); padding-left: 1rem; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.95em;
+  }
+  th,
+  td {
+    text-align: left;
+    padding: 0.45rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    font-variant: small-caps;
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .boundary {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82em;
+    line-height: 1.4;
+    white-space: pre;
+  }
+  .danger {
+    border-left: 3px solid var(--accent);
+    padding-left: 1rem;
+  }
 </style>
 <main>
   <h1>Secure PR Preview Lifecycle</h1>
-  <p class="lesson-meta">Lesson 13 · planned lesson 17 · ~60–90 min · build untrusted code without credentials, publish one isolated preview through a dev-only role, then remove it on close</p>
-  <p class="lesson-meta">Prerequisite: <a href="0012-approval-gated-keyless-deploys.html">lesson 12</a> complete: production uses an approved OIDC role, the static AWS keys are gone, and the separate <code>dev</code> Environment exists.</p>
+  <p class="lesson-meta">
+    Lesson 13 · planned lesson 17 · ~60–90 min · build untrusted code without
+    credentials, publish one isolated preview through a dev-only role, then
+    remove it on close
+  </p>
+  <p class="lesson-meta">
+    Prerequisite:
+    <a href="0012-approval-gated-keyless-deploys.html">lesson 12</a> complete:
+    production uses an approved OIDC role, the static AWS keys are gone, and the
+    separate <code>dev</code> Environment exists.
+  </p>
 
-  <p>A preview is a temporary deployment with a lifecycle: a successful same-repository PR build creates or replaces <code>previews/pr-&lt;number&gt;/</code>; closing that PR removes exactly the same prefix. The difficult part is not <code>aws s3 sync</code>. It is preventing code under review from controlling the job that receives AWS credentials.</p>
+  <p>
+    A preview is a temporary deployment with a lifecycle: a successful
+    same-repository PR build creates or replaces
+    <code>previews/pr-&lt;number&gt;/</code>; closing that PR removes exactly
+    the same prefix. The difficult part is not <code>aws s3 sync</code>. It is
+    preventing code under review from controlling the job that receives AWS
+    credentials.
+  </p>
 
-  <div class="boundary">untrusted pull_request run                 trusted default-branch run
-┌─────────────────────────────┐            ┌──────────────────────────────┐
-│ checkout PR merge commit    │            │ workflow_run after green CI  │
-│ npm ci + test + build       │── site ──► │ approve dev Environment      │
-│ upload artifact             │  artifact  │ assume dev-only OIDC role    │
-│ no id-token, no AWS         │            │ sync bytes; execute nothing  │
-└─────────────────────────────┘            └──────────────┬───────────────┘
-                                                         ▼
-                                      s3://DEV/previews/pr-42/
-                                                         │
-PR closed → unprivileged cleanup request → trusted workflow_run → delete pr-42/</div>
+  <div class="boundary">
+    untrusted pull_request run trusted default-branch run
+    ┌─────────────────────────────┐ ┌──────────────────────────────┐ │ checkout
+    PR merge commit │ │ workflow_run after green CI │ │ npm ci + test + build
+    │── site ──► │ approve dev Environment │ │ upload artifact │ artifact │
+    assume dev-only OIDC role │ │ no id-token, no AWS │ │ sync bytes; execute
+    nothing │ └─────────────────────────────┘ └──────────────┬───────────────┘ ▼
+    s3://DEV/previews/pr-42/ │ PR closed → unprivileged cleanup request →
+    trusted workflow_run → delete pr-42/
+  </div>
 
-  <p>The first workflow may execute hostile code, so it receives no cloud identity. The second workflow may receive a dev identity, so it never checks out the PR or executes its artifact. GitHub documents <a href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run"><code>workflow_run</code> as a privilege-separation mechanism</a>, but also warns that its artifacts are untrusted; this design uses the artifact only as static files to upload.</p>
+  <p>
+    The first workflow may execute hostile code, so it receives no cloud
+    identity. The second workflow may receive a dev identity, so it never checks
+    out the PR or executes its artifact. GitHub documents
+    <a
+      href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run"
+      ><code>workflow_run</code> as a privilege-separation mechanism</a
+    >, but also warns that its artifacts are untrusted; this design uses the
+    artifact only as static files to upload.
+  </p>
 
   <div class="primary-source">
-    Continue Frontend Masters’ <a href="https://frontendmasters.com/courses/github-actions/"><strong>Cloud CI/CD with GitHub Actions</strong></a> by applying its <strong>Environment Protection &amp; OIDC</strong> boundary to a pre-production target. GitHub’s current <a href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run"><code>workflow_run</code> reference</a> and <a href="https://docs.github.com/en/actions/reference/security/secure-use">secure-use guidance</a> are authoritative for the cross-run handoff and untrusted-artifact rule. Keep the <a href="../reference/pr-preview-lifecycle.html">PR preview lifecycle reference</a> open.
+    Continue Frontend Masters’
+    <a href="https://frontendmasters.com/courses/github-actions/"
+      ><strong>Cloud CI/CD with GitHub Actions</strong></a
+    >
+    by applying its <strong>Environment Protection &amp; OIDC</strong> boundary
+    to a pre-production target. GitHub’s current
+    <a
+      href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run"
+      ><code>workflow_run</code> reference</a
+    >
+    and
+    <a href="https://docs.github.com/en/actions/reference/security/secure-use"
+      >secure-use guidance</a
+    >
+    are authoritative for the cross-run handoff and untrusted-artifact rule.
+    Keep the
+    <a href="../reference/pr-preview-lifecycle.html"
+      >PR preview lifecycle reference</a
+    >
+    open.
   </div>
 
   <h2>Checkpoint 1 — give previews their own blast radius</h2>
 
-  <p>Create a separate private preview bucket and CloudFront distribution by repeating the S3 REST origin + OAC pattern from <a href="0011-private-cloudfront-delivery.html">lesson 11</a>. Use a separate dev hostname or CloudFront domain; preview HTML is reviewer-visible but still attacker-controlled, so it must not inherit production cookies, credentials, or origin trust.</p>
+  <p>
+    Create a separate private preview bucket and CloudFront distribution by
+    repeating the S3 REST origin + OAC pattern from
+    <a href="0011-private-cloudfront-delivery.html">lesson 11</a>. Use a
+    separate dev hostname or CloudFront domain; preview HTML is reviewer-visible
+    but still attacker-controlled, so it must not inherit production cookies,
+    credentials, or origin trust.
+  </p>
 
-  <p>For this learning project, attach CloudFront’s managed <a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html#managed-cache-policy-caching-disabled"><strong>CachingDisabled</strong> policy</a> to the dev distribution. Its minimum, default, and maximum TTL are all zero, so replacing or deleting a preview is observable immediately. Lesson 14 will make the production latency–cost–freshness decision explicitly; do not weaken production caching today.</p>
+  <p>
+    For this learning project, attach CloudFront’s managed
+    <a
+      href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html#managed-cache-policy-caching-disabled"
+      ><strong>CachingDisabled</strong> policy</a
+    >
+    to the dev distribution. Its minimum, default, and maximum TTL are all zero,
+    so replacing or deleting a preview is observable immediately. Lesson 14 will
+    make the production latency–cost–freshness decision explicitly; do not
+    weaken production caching today.
+  </p>
 
   <p>Now tighten the <code>dev</code> Environment from lesson 12:</p>
 
   <ul>
-    <li>add a required reviewer; allow self-review only if solo practice makes separation of duties impossible;</li>
-    <li>store <code>AWS_ACCOUNT_ID</code>, <code>AWS_REGION</code>, <code>AWS_ROLE_ARN</code>, <code>DEV_S3_BUCKET</code>, and <code>DEV_BASE_URL</code> as environment variables;</li>
-    <li>create <code>gha-dev-preview</code> with the exact immutable OIDC subject ending in <code>environment:dev</code>;</li>
-    <li>grant it access only to <code>previews/*</code> in the dev bucket—no production bucket and no production distribution.</li>
+    <li>
+      add a required reviewer; allow self-review only if solo practice makes
+      separation of duties impossible;
+    </li>
+    <li>
+      store <code>AWS_ACCOUNT_ID</code>, <code>AWS_REGION</code>,
+      <code>AWS_ROLE_ARN</code>, <code>DEV_S3_BUCKET</code>, and
+      <code>DEV_BASE_URL</code> as environment variables;
+    </li>
+    <li>
+      create <code>gha-dev-preview</code> with the exact immutable OIDC subject
+      ending in <code>environment:dev</code>;
+    </li>
+    <li>
+      grant it access only to <code>previews/*</code> in the dev bucket—no
+      production bucket and no production distribution.
+    </li>
   </ul>
 
-<pre><code>{
+  <pre><code>{
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -78,15 +178,31 @@ PR closed → unprivileged cleanup request → trusted workflow_run → delete p
   ]
 }</code></pre>
 
-  <p>S3 has objects and key prefixes, not real directories. The bucket-level <code>ListBucket</code> permission therefore uses an <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html#amazon-s3-policy-keys-prefix"><code>s3:prefix</code> condition</a>, while object writes and deletes use the narrower object ARN. The role can replace any preview, but cannot escape the dev bucket or reach production.</p>
+  <p>
+    S3 has objects and key prefixes, not real directories. The bucket-level
+    <code>ListBucket</code> permission therefore uses an
+    <a
+      href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html#amazon-s3-policy-keys-prefix"
+      ><code>s3:prefix</code> condition</a
+    >, while object writes and deletes use the narrower object ARN. The role can
+    replace any preview, but cannot escape the dev bucket or reach production.
+  </p>
 
-  <div class="quiz" data-quiz='{"q":"Which control keeps a preview compromise away from production?","options":["A separate role with dev-only resources","A shared role with broader resources","A production role after manual approval"],"answer":0,"why":"Approval limits when a job starts. Separate trust and permission policies limit what a compromised preview path can reach."}'></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"Which control keeps a preview compromise away from production?","options":["A separate role with dev-only resources","A shared role with broader resources","A production role after manual approval"],"answer":0,"why":"Approval limits when a job starts. Separate trust and permission policies limit what a compromised preview path can reach."}'
+  ></div>
 
   <h2>Checkpoint 2 — keep PR CI unprivileged</h2>
 
-  <p>Give the event-facing workflow a stable display name because <code>workflow_run.workflows</code> matches it. Keep its existing PR CI and post-merge production deploy; do not add <code>id-token: write</code> to the caller or reusable CI.</p>
+  <p>
+    Give the event-facing workflow a stable display name because
+    <code>workflow_run.workflows</code> matches it. Keep its existing PR CI and
+    post-merge production deploy; do not add <code>id-token: write</code> to the
+    caller or reusable CI.
+  </p>
 
-<pre><code>name: Pipeline
+  <pre><code>name: Pipeline
 
 on:
   pull_request:
@@ -108,11 +224,24 @@ jobs:
     needs: ci
     # existing production Environment + OIDC deploy remains unchanged</code></pre>
 
-  <p>On a fork PR, GitHub <a href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories">withholds secrets and reduces <code>GITHUB_TOKEN</code> to read-only</a>. OIDC is not a stored secret, however, so “forks receive no secrets” is not a sufficient cloud boundary. The privileged workflow below also requires <code>head_repository.full_name == github.repository</code>; fork builds remain useful CI, but cannot reach the dev Environment.</p>
+  <p>
+    On a fork PR, GitHub
+    <a
+      href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories"
+      >withholds secrets and reduces <code>GITHUB_TOKEN</code> to read-only</a
+    >. OIDC is not a stored secret, however, so “forks receive no secrets” is
+    not a sufficient cloud boundary. The privileged workflow below also requires
+    <code>head_repository.full_name == github.repository</code>; fork builds
+    remain useful CI, but cannot reach the dev Environment.
+  </p>
 
-  <p>Add one inert close-event workflow. It carries no credentials and checks out nothing; it exists only to produce a completed run that the trusted lifecycle workflow can observe.</p>
+  <p>
+    Add one inert close-event workflow. It carries no credentials and checks out
+    nothing; it exists only to produce a completed run that the trusted
+    lifecycle workflow can observe.
+  </p>
 
-<pre><code># .github/workflows/preview-cleanup-request.yml
+  <pre><code># .github/workflows/preview-cleanup-request.yml
 name: Preview cleanup request
 
 on:
@@ -131,13 +260,30 @@ jobs:
           PR_NUMBER: ${{ github.event.number }}
         run: echo "Preview cleanup requested for PR $PR_NUMBER"</code></pre>
 
-  <p class="danger"><strong>Do not switch to <code>pull_request_target</code> and check out the PR.</strong> That event runs in the base repository’s privileged context. GitHub’s <a href="https://docs.github.com/en/actions/reference/security/secure-use#mitigating-the-risks-of-untrusted-code-checkout">secure-use guidance</a> warns that combining privileged triggers with untrusted checkout can expose write tokens or secrets.</p>
+  <p class="danger">
+    <strong
+      >Do not switch to <code>pull_request_target</code> and check out the
+      PR.</strong
+    >
+    That event runs in the base repository’s privileged context. GitHub’s
+    <a
+      href="https://docs.github.com/en/actions/reference/security/secure-use#mitigating-the-risks-of-untrusted-code-checkout"
+      >secure-use guidance</a
+    >
+    warns that combining privileged triggers with untrusted checkout can expose
+    write tokens or secrets.
+  </p>
 
   <h2>Checkpoint 3 — publish from the trusted side</h2>
 
-  <p>Create <code>.github/workflows/preview-lifecycle.yml</code> on <code>main</code>. It responds to completed runs of either named workflow. <code>workflow_run</code> loads this definition from the default branch, so a PR cannot edit the privileged steps it is about to trigger.</p>
+  <p>
+    Create <code>.github/workflows/preview-lifecycle.yml</code> on
+    <code>main</code>. It responds to completed runs of either named workflow.
+    <code>workflow_run</code> loads this definition from the default branch, so
+    a PR cannot edit the privileged steps it is about to trigger.
+  </p>
 
-<pre><code>name: Preview lifecycle
+  <pre><code>name: Preview lifecycle
 
 on:
   workflow_run:
@@ -203,30 +349,84 @@ jobs:
           curl --fail --retry 8 --retry-delay 2 "$PREVIEW_URL" |
             grep -F "Deployed by GitHub Actions"</code></pre>
 
-  <p>Notice what is absent: no checkout, no <code>npm</code>, no local action, and no shell script downloaded from the artifact. The trusted workflow interprets only a PR number from GitHub’s event payload, validates it as digits, and uploads already-built bytes to one prefix.</p>
+  <p>
+    Notice what is absent: no checkout, no <code>npm</code>, no local action,
+    and no shell script downloaded from the artifact. The trusted workflow
+    interprets only a PR number from GitHub’s event payload, validates it as
+    digits, and uploads already-built bytes to one prefix.
+  </p>
 
   <div class="exercise">
-    <span class="exercise-label">Exercise 1 — prove isolated create and update</span>
-    <p>Write the dev policy, cleanup-request workflow, and deploy job from scratch. Run <code>actionlint</code>. Merge these trusted workflow definitions to <code>main</code> before testing them; <code>workflow_run</code> only triggers from a definition present on the default branch.</p>
-    <p>Open a same-repository PR that changes visible site text. Confirm <strong>Pipeline</strong> finishes first, then <strong>Preview lifecycle</strong> pauses at <code>dev</code>. Inspect the PR and workflow changes before approval. Approve, visit the Environment URL, then push a second site change and approve again.</p>
-    <div class="expect">Both preview runs use <code>assumed-role/gha-dev-preview/</code> and the same <code>/previews/pr-N/index.html</code> URL. The second run replaces that PR’s content. The production workflow, bucket, distribution, and role are untouched.</div>
-    <details><summary>Failure routing</summary>
+    <span class="exercise-label"
+      >Exercise 1 — prove isolated create and update</span
+    >
+    <p>
+      Write the dev policy, cleanup-request workflow, and deploy job from
+      scratch. Run <code>actionlint</code>. Merge these trusted workflow
+      definitions to <code>main</code> before testing them;
+      <code>workflow_run</code> only triggers from a definition present on the
+      default branch.
+    </p>
+    <p>
+      Open a same-repository PR that changes visible site text. Confirm
+      <strong>Pipeline</strong> finishes first, then
+      <strong>Preview lifecycle</strong> pauses at <code>dev</code>. Inspect the
+      PR and workflow changes before approval. Approve, visit the Environment
+      URL, then push a second site change and approve again.
+    </p>
+    <div class="expect">
+      Both preview runs use <code>assumed-role/gha-dev-preview/</code> and the
+      same <code>/previews/pr-N/index.html</code> URL. The second run replaces
+      that PR’s content. The production workflow, bucket, distribution, and role
+      are untouched.
+    </div>
+    <details>
+      <summary>Failure routing</summary>
       <ul>
-        <li>No lifecycle run: <code>preview-lifecycle.yml</code> is not yet on <code>main</code>, or <code>workflows: [Pipeline]</code> does not exactly match the triggering workflow’s <code>name:</code>.</li>
-        <li>Lifecycle run but deploy skipped: inspect conclusion, triggering event, head repository, and <code>pull_requests[0].number</code> in the event payload.</li>
-        <li>Artifact not found: pass both the triggering <code>run-id</code> and <code>github-token</code>; a plain download searches only the current run.</li>
-        <li>STS denied: the dev role trust subject must end in <code>environment:dev</code>, not a PR ref or <code>production</code>.</li>
-        <li>S3 denied: distinguish bucket-level listing from object-level write/delete resources.</li>
-        <li>Old content persists: confirm the dev distribution uses <strong>CachingDisabled</strong>; do not add production invalidation permissions to the dev role.</li>
+        <li>
+          No lifecycle run: <code>preview-lifecycle.yml</code> is not yet on
+          <code>main</code>, or <code>workflows: [Pipeline]</code> does not
+          exactly match the triggering workflow’s <code>name:</code>.
+        </li>
+        <li>
+          Lifecycle run but deploy skipped: inspect conclusion, triggering
+          event, head repository, and <code>pull_requests[0].number</code> in
+          the event payload.
+        </li>
+        <li>
+          Artifact not found: pass both the triggering <code>run-id</code> and
+          <code>github-token</code>; a plain download searches only the current
+          run.
+        </li>
+        <li>
+          STS denied: the dev role trust subject must end in
+          <code>environment:dev</code>, not a PR ref or <code>production</code>.
+        </li>
+        <li>
+          S3 denied: distinguish bucket-level listing from object-level
+          write/delete resources.
+        </li>
+        <li>
+          Old content persists: confirm the dev distribution uses
+          <strong>CachingDisabled</strong>; do not add production invalidation
+          permissions to the dev role.
+        </li>
       </ul>
     </details>
   </div>
 
   <h2>Checkpoint 4 — close means delete</h2>
 
-  <p>Add a sibling <code>cleanup</code> job to <code>preview-lifecycle.yml</code>. It accepts only a successful <strong>Preview cleanup request</strong> run for a same-repository PR, assumes the same dev role, and deletes the validated prefix. Reuse the credential and prefix-derivation steps from deploy; then perform only this side effect and verification:</p>
+  <p>
+    Add a sibling <code>cleanup</code> job to
+    <code>preview-lifecycle.yml</code>. It accepts only a successful
+    <strong>Preview cleanup request</strong> run for a same-repository PR,
+    assumes the same dev role, and deletes the validated prefix. Reuse the
+    credential and prefix-derivation steps from deploy; then perform only this
+    side effect and verification:
+  </p>
 
-<pre><code>  cleanup:
+  <pre><code>  cleanup:
     if: &gt;-
       github.event.workflow_run.name == 'Preview cleanup request' &amp;&amp;
       github.event.workflow_run.event == 'pull_request' &amp;&amp;
@@ -263,42 +463,126 @@ jobs:
           STATUS="$(curl --silent --output /dev/null --write-out '%{http_code}' "$PREVIEW_URL")"
           test "$STATUS" = 403 -o "$STATUS" = 404</code></pre>
 
-  <p>The <a href="https://docs.aws.amazon.com/cli/latest/userguide/cli-services-s3-commands.html#using-s3-commands-delete-objects"><code>aws s3 rm --recursive</code></a> delete is safe only because the prefix is derived from a validated integer—not PR title, branch name, artifact text, or arbitrary input. Repeating cleanup is idempotent: zero matching objects remains success.</p>
+  <p>
+    The
+    <a
+      href="https://docs.aws.amazon.com/cli/latest/userguide/cli-services-s3-commands.html#using-s3-commands-delete-objects"
+      ><code>aws s3 rm --recursive</code></a
+    >
+    delete is safe only because the prefix is derived from a validated
+    integer—not PR title, branch name, artifact text, or arbitrary input.
+    Repeating cleanup is idempotent: zero matching objects remains success.
+  </p>
 
   <div class="exercise">
-    <span class="exercise-label">Exercise 2 — prove cleanup and fork denial</span>
+    <span class="exercise-label"
+      >Exercise 2 — prove cleanup and fork denial</span
+    >
     <ol>
-      <li>Open two same-repository PRs and deploy both previews. Record their distinct URLs and list both S3 prefixes.</li>
-      <li>Close one PR. Approve its cleanup, then verify its key count is zero and its URL returns 403 or 404.</li>
-      <li>Verify the other PR preview still works. This is the isolation proof; “the target disappeared” alone is insufficient.</li>
-      <li>From a fork, open a harmless PR. Let CI run, then inspect <strong>Preview lifecycle</strong>: the deploy job must be skipped by the head-repository condition, before any Environment approval or OIDC step.</li>
+      <li>
+        Open two same-repository PRs and deploy both previews. Record their
+        distinct URLs and list both S3 prefixes.
+      </li>
+      <li>
+        Close one PR. Approve its cleanup, then verify its key count is zero and
+        its URL returns 403 or 404.
+      </li>
+      <li>
+        Verify the other PR preview still works. This is the isolation proof;
+        “the target disappeared” alone is insufficient.
+      </li>
+      <li>
+        From a fork, open a harmless PR. Let CI run, then inspect
+        <strong>Preview lifecycle</strong>: the deploy job must be skipped by
+        the head-repository condition, before any Environment approval or OIDC
+        step.
+      </li>
     </ol>
-    <div class="expect">Closing PR A removes only <code>previews/pr-A/</code>; PR B still serves its own content. The fork PR receives CI but produces no dev deployment, no approval prompt, and no AWS identity.</div>
-    <details><summary>Self-check</summary>
-      <p>Full credit requires four observations: two distinct live prefixes, one prefix empty after close, the sibling preview still live, and a fork-triggered deploy visibly skipped. Also confirm direct S3 reads remain denied and the production role’s policy contains no dev bucket ARN.</p>
+    <div class="expect">
+      Closing PR A removes only <code>previews/pr-A/</code>; PR B still serves
+      its own content. The fork PR receives CI but produces no dev deployment,
+      no approval prompt, and no AWS identity.
+    </div>
+    <details>
+      <summary>Self-check</summary>
+      <p>
+        Full credit requires four observations: two distinct live prefixes, one
+        prefix empty after close, the sibling preview still live, and a
+        fork-triggered deploy visibly skipped. Also confirm direct S3 reads
+        remain denied and the production role’s policy contains no dev bucket
+        ARN.
+      </p>
     </details>
   </div>
 
   <h2>Check yourself</h2>
 
-  <div class="quiz" data-quiz='{"q":"Why split build and preview deployment across workflow runs?","options":["CI builds; default-branch workflow deploys the artifact","PR code builds and deploys with credentials","Fork code receives production credentials after approval"],"answer":0,"why":"The split lets untrusted code build without credentials while a default-branch workflow owns the privileged, non-executing deployment steps."}'></div>
-  <div class="quiz" data-quiz='{"q":"Why is the same-repository condition still required?","options":["OIDC tokens are not stored repository secrets","Fork artifacts are always syntactically invalid files","Environment reviewers automatically reject every external fork"],"answer":0,"why":"Fork secret restrictions do not themselves express who may request an OIDC-backed cloud identity. The explicit condition makes that policy visible and testable."}'></div>
-  <div class="quiz" data-quiz='{"q":"What may the privileged workflow do with the artifact?","options":["Upload its validated files as static data","Execute its bundled scripts after manual review","Source its variables into the runner shell"],"answer":0,"why":"The artifact crossed from an untrusted workflow. Validating expected files and uploading bytes is bounded; executing or sourcing it crosses the trust boundary."}'></div>
-  <div class="quiz" data-quiz='{"q":"What proves preview prefixes are isolated correctly?","options":["Deleting one still leaves another preview reachable","Deleting one removes the entire dev bucket","Deleting one unexpectedly triggers a production redeployment"],"answer":0,"why":"Isolation is demonstrated by a targeted destructive test: the selected prefix disappears while a sibling tenant remains available."}'></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"Why split build and preview deployment across workflow runs?","options":["CI builds; default-branch workflow deploys the artifact","PR code builds and deploys with credentials","Fork code receives production credentials after approval"],"answer":0,"why":"The split lets untrusted code build without credentials while a default-branch workflow owns the privileged, non-executing deployment steps."}'
+  ></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"Why is the same-repository condition still required?","options":["OIDC tokens are not stored repository secrets","Fork artifacts are always syntactically invalid files","Environment reviewers automatically reject every external fork"],"answer":0,"why":"Fork secret restrictions do not themselves express who may request an OIDC-backed cloud identity. The explicit condition makes that policy visible and testable."}'
+  ></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"What may the privileged workflow do with the artifact?","options":["Upload its validated files as static data","Execute its bundled scripts after manual review","Source its variables into the runner shell"],"answer":0,"why":"The artifact crossed from an untrusted workflow. Validating expected files and uploading bytes is bounded; executing or sourcing it crosses the trust boundary."}'
+  ></div>
+  <div
+    class="quiz"
+    data-quiz='{"q":"What proves preview prefixes are isolated correctly?","options":["Deleting one still leaves another preview reachable","Deleting one removes the entire dev bucket","Deleting one unexpectedly triggers a production redeployment"],"answer":0,"why":"Isolation is demonstrated by a targeted destructive test: the selected prefix disappears while a sibling tenant remains available."}'
+  ></div>
 
   <h2>Design question — decide, then defend</h2>
 
   <div class="exercise">
-    <span class="exercise-label">Same-run convenience or cross-run privilege separation?</span>
-    <p>Choose (A) put <code>id-token: write</code> and preview deployment after CI in the PR’s own workflow run, or (B) let unprivileged PR CI finish and trigger a default-branch <code>workflow_run</code> deploy. Name the extra operational cost and the security consequence.</p>
-    <details><summary>Model answer and rubric</summary>
-      <p><strong>Choose B.</strong> A PR can propose changes to its workflow. In the same-run design, approval may start privileged steps from that proposed definition; reviewers must notice every malicious workflow edit. The split keeps credential-bearing code on <code>main</code> and limits the handoff to an artifact that is validated and never executed.</p>
-      <p>The cost is a second workflow run, explicit cross-run artifact download, stable workflow-name coupling, harder event-context debugging, and a separate cleanup signal. Full credit requires a decision, at least one of those costs, and the rule that the privileged workflow never checks out or executes untrusted content.</p>
+    <span class="exercise-label"
+      >Same-run convenience or cross-run privilege separation?</span
+    >
+    <p>
+      Choose (A) put <code>id-token: write</code> and preview deployment after
+      CI in the PR’s own workflow run, or (B) let unprivileged PR CI finish and
+      trigger a default-branch <code>workflow_run</code> deploy. Name the extra
+      operational cost and the security consequence.
+    </p>
+    <details>
+      <summary>Model answer and rubric</summary>
+      <p>
+        <strong>Choose B.</strong> A PR can propose changes to its workflow. In
+        the same-run design, approval may start privileged steps from that
+        proposed definition; reviewers must notice every malicious workflow
+        edit. The split keeps credential-bearing code on <code>main</code> and
+        limits the handoff to an artifact that is validated and never executed.
+      </p>
+      <p>
+        The cost is a second workflow run, explicit cross-run artifact download,
+        stable workflow-name coupling, harder event-context debugging, and a
+        separate cleanup signal. Full credit requires a decision, at least one
+        of those costs, and the rule that the privileged workflow never checks
+        out or executes untrusted content.
+      </p>
     </details>
   </div>
 
-  <p class="danger"><strong>Done means the lifecycle and its negative paths are proven.</strong> A green preview alone is incomplete: closing removes only its prefix, a sibling survives, a fork gets CI without deployment, and neither dev policy contains a production ARN nor production policy a dev ARN.</p>
+  <p class="danger">
+    <strong>Done means the lifecycle and its negative paths are proven.</strong>
+    A green preview alone is incomplete: closing removes only its prefix, a
+    sibling survives, a fork gets CI without deployment, and neither dev policy
+    contains a production ARN nor production policy a dev ARN.
+  </p>
 
-  <div class="ask-agent">Ask your teacher if the downstream workflow does not trigger, the cross-run artifact is missing, the dev Environment never pauses, the role assumes but S3 denies one operation, cleanup removes the object but CloudFront still serves it, or a fork reaches an approval prompt. Bring both run URLs, the redacted event fields used by the job condition, the exact prefix, and the first failing AWS command. Next: <a href="0014-production-release-hardening.html">harden production freshness and release correctness</a> with cache headers, invalidation, SHA pinning, and deploy concurrency.</div>
+  <div class="ask-agent">
+    Ask your teacher if the downstream workflow does not trigger, the cross-run
+    artifact is missing, the dev Environment never pauses, the role assumes but
+    S3 denies one operation, cleanup removes the object but CloudFront still
+    serves it, or a fork reaches an approval prompt. Bring both run URLs, the
+    redacted event fields used by the job condition, the exact prefix, and the
+    first failing AWS command. Next:
+    <a href="0014-production-release-hardening.html"
+      >harden production freshness and release correctness</a
+    >
+    with cache headers, invalidation, SHA pinning, and deploy concurrency.
+  </div>
 </main>
 <script src="../assets/quiz.js"></script>
