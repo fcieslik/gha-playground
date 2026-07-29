@@ -1,0 +1,164 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 11: Studio B — Private CloudFront Delivery</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
+  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-variant: small-caps; font-weight: 400; color: var(--muted); }
+  .studio-banner { background: var(--win-bg); border: 1px solid var(--win-border); border-radius: 6px; padding: 0.6rem 1rem; margin: 1.2rem 0 2rem; font-variant: small-caps; letter-spacing: 0.05em; color: var(--win-border); }
+  .graph { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.1rem; overflow-x: auto; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.82em; line-height: 1.35; white-space: pre; }
+</style>
+<main>
+  <h1>Studio B — Private CloudFront Delivery</h1>
+  <p class="lesson-meta">Lesson 11 · combines planned lessons 13–14 · ~120–150 min · decide the delivery boundary, record ADR-002, then replace the public S3 website with a private S3 origin behind HTTPS CloudFront</p>
+  <p class="lesson-meta">Prerequisite: lesson 10 complete: <code>ci / required</code> protects <code>main</code>, and its post-merge deploy syncs the tested <code>site</code> artifact to the temporary public S3 website endpoint from lessons 6–7.</p>
+
+  <div class="studio-banner">Studio session · hard checkpoint: commit ADR-002 before changing AWS</div>
+
+  <p>The public S3 website was a useful proof of the deploy loop, not a production boundary. Anyone can bypass it, it is HTTP-only, and its public-read policy is the opposite of an origin that only your delivery layer may read. Today you replace it with a deliberately small architecture: CloudFront is the public HTTPS entry point; a private S3 bucket is the origin; Origin Access Control (OAC) is the one identity allowed to read it.</p>
+
+  <div class="primary-source">
+    Course connection: revisit Frontend Masters’ <a href="https://frontendmasters.com/courses/github-actions/"><strong>Deploying to AWS</strong></a> segment. For the current implementation details, use AWS’s <a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html"><strong>OAC and private S3 origins guide</strong></a>, then keep the <a href="../reference/aws-s3-static-site.html">S3 PoC reference</a> open only for the existing deploy identity and teardown commands.
+  </div>
+
+  <h2>See the boundary before changing it</h2>
+
+  <div class="graph">Before: viewer ──HTTP──&gt; public S3 website endpoint
+                         ▲             ▲
+                         └── can bypass ┘
+
+After:  viewer ──HTTPS──&gt; CloudFront distribution ──signed HTTPS──&gt; private S3 bucket
+                              public entry point             ▲
+                                                               │
+                          bucket policy allows only CloudFront service principal
+                          when AWS:SourceArn == this distribution ARN</div>
+
+  <p>The crucial vocabulary is <strong>origin</strong>, not “website.” CloudFront must use the bucket’s normal S3 REST origin, such as <code>BUCKET.s3.REGION.amazonaws.com</code>. The S3 <em>website</em> endpoint is a custom origin and cannot use OAC. Set the CloudFront default root object to <code>index.html</code>; do not leave static website hosting as a dependency.</p>
+
+  <table>
+    <thead><tr><th>Concern</th><th>Public S3 website PoC</th><th>Private CloudFront design</th></tr></thead>
+    <tbody>
+      <tr><td>Public entry point</td><td>HTTP S3 website URL</td><td>CloudFront distribution domain over HTTPS</td></tr>
+      <tr><td>Origin access</td><td>Any internet principal can read objects</td><td>Only <code>cloudfront.amazonaws.com</code>, tied to one distribution ARN</td></tr>
+      <tr><td>Viewer protocol</td><td>No HTTPS</td><td>Redirect HTTP to HTTPS</td></tr>
+      <tr><td>Cache freshness</td><td>Every request reaches S3</td><td>Edge cache trades freshness for latency/origin load</td></tr>
+      <tr><td>Rollback</td><td>Re-sync older artifact</td><td>Re-sync older artifact <em>and</em> consider cached objects</td></tr>
+    </tbody>
+  </table>
+
+  <p>CloudFront does not make the site private to viewers; it makes the <em>origin</em> private. Anyone can still request a public site through the distribution. If later you need viewer authentication, signed URLs/cookies or an application auth layer is a separate decision.</p>
+
+  <h2>Checkpoint — ADR-002 before implementation</h2>
+  <p>The decision is not “turn on CloudFront.” It is which boundary you accept, how cached releases become visible, and how an operator returns to a known-good release. Draw the following in <code>docs/delivery.md</code>, then commit <code>docs/adr/0002-private-cloudfront-origin.md</code> before opening the AWS console.</p>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 1 — diagram and decide</span>
+    <p>Draw the after-state architecture and annotate: the public entry point, the private origin, the deployment identity, the OAC identity, the bucket-policy condition, and what a direct S3 object request returns. Then write ADR-002 using the <a href="../reference/adr-format.html">ADR format</a>. Your Consequences must state one cache/freshness choice and one rollback consequence.</p>
+    <div class="expect">Two committed files. A teammate can answer “can a viewer bypass CloudFront?” and “what must happen after a rollback?” without opening the console. The ADR decision names CloudFront + a private S3 REST origin + OAC, not merely “use a CDN.”</div>
+    <details><summary>Model ADR-002</summary>
+<pre><code># ADR-002: Deliver the static site through CloudFront with a private S3 origin
+
+## Status
+Accepted — 2026-07-24
+
+## Context
+The public S3 website endpoint proves deployment but has no HTTPS and lets
+viewers bypass any edge policy. We need one public HTTPS entry point while
+keeping the tested site artifact and the existing least-privilege deploy
+identity. Edge caching reduces latency and origin requests, but makes a
+new or rolled-back object temporarily less immediately visible.
+
+## Decision
+We will serve the site through a CloudFront distribution with HTTPS redirect,
+an S3 REST origin, and an OAC that always signs origin requests. The bucket
+will block public access and allow s3:GetObject only to CloudFront when the
+request SourceArn is this distribution. The default root object is index.html.
+
+## Consequences
+- Direct S3 object URLs are denied; the CloudFront domain is the only public
+  delivery entry point.
+- We retain the current artifact-to-S3 deploy contract and verify the
+  CloudFront URL after deployment.
+- We accept propagation and caching delay. A release or rollback may need a
+  targeted invalidation until immutable, content-hashed asset names exist.
+- CloudFront adds a billable service and a second operational configuration.
+</code></pre>
+    </details>
+  </div>
+
+  <h2>Implement the accepted boundary</h2>
+  <p>Create one standard CloudFront distribution. Choose the existing bucket as an <strong>S3 bucket origin</strong>—not its website endpoint—then set Viewer protocol policy to <strong>Redirect HTTP to HTTPS</strong>, Allowed HTTP methods to <strong>GET, HEAD</strong>, and Default root object to <code>index.html</code>. Create an OAC for origin type S3 with <strong>Sign requests (recommended)</strong>, attach it to that origin, and wait until the distribution status is <em>Deployed</em>.</p>
+
+  <p>OAC’s “always sign” setting means CloudFront signs requests it sends to the S3 origin. It does not grant access on its own; the bucket policy is the second half. Keep S3 Block Public Access enabled and replace the old public-read statement with this narrowly scoped read permission:</p>
+
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontReadOnly",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudfront.amazonaws.com" },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::YOUR-ACCOUNT-ID:distribution/YOUR-DISTRIBUTION-ID"
+        }
+      }
+    }
+  ]
+}</code></pre>
+
+  <p>The condition is not decoration. The CloudFront service principal is broad; <code>AWS:SourceArn</code> narrows it to the one distribution you control. Your Actions IAM user still has its separate <code>PutObject</code>/<code>DeleteObject</code> deploy authority from lesson 7. Do not add write authority for CloudFront; viewers only read this static origin.</p>
+
+  <h2>Cache is release behavior</h2>
+  <p>A cache hit is a copy at an edge, not proof that the origin has the latest object. For this un-hashed starter site, choose a simple, explicit release policy: use the managed <strong>CachingOptimized</strong> cache policy for the default behavior and invalidate <code>/*</code> after every deploy. That is intentionally correct-before-cheap. Lesson 14 replaces blanket invalidation with cache headers and immutable hashed asset names.</p>
+
+  <p class="aside"><strong>Do not confuse invalidation with deployment.</strong> <code>aws s3 sync --delete</code> converges origin objects to the artifact; an invalidation tells CloudFront not to keep serving cached copies. They solve separate states. Invalidation paths beginning with <code>/</code> match the viewer URL path, so <code>/*</code> is the broad, easy-to-reason-about first policy.</p>
+
+  <h2>Check yourself</h2>
+
+  <div class="quiz" data-quiz='{"q":"Which S3 origin can use OAC?","options":["The normal S3 REST bucket origin","The S3 static-website endpoint","Either endpoint after enabling public read"],"answer":0,"why":"OAC works with a regular S3 bucket origin. A website endpoint is a custom origin and cannot use OAC."}'></div>
+  <div class="quiz" data-quiz='{"q":"What makes the bucket policy allow only this distribution?","options":["The AWS:SourceArn condition with the distribution ARN","The distribution domain name in the resource","Redirect HTTP to HTTPS"],"answer":0,"why":"The service principal identifies CloudFront generally; SourceArn scopes the permission to one distribution. Redirect controls viewer protocol, not S3 authorization."}'></div>
+  <div class="quiz" data-quiz='{"q":"What must a rollback account for after copying an older artifact to S3?","options":["CloudFront may still serve cached newer objects","The artifact is automatically deleted","OAC grants the deploy job no S3 write access"],"answer":0,"why":"Origin state can be old while edge caches retain a newer response. Invalidation or an intentional TTL policy controls that visibility gap."}'></div>
+  <div class="quiz" data-quiz='{"q":"Does a private S3 origin mean the public website requires login?","options":["No; it protects origin access, not viewers","Yes; OAC signs every browser request","Only if the bucket has index.html"],"answer":0,"why":"Browsers talk to CloudFront, which can still be public. OAC only governs CloudFront-to-S3 origin requests."}'></div>
+
+  <h2>Do it for real</h2>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 2 — cut over without widening access</span>
+    <p>After ADR-002 is committed, create the distribution and OAC as above. Replace—not append to—the bucket’s old public-read policy. Keep Block Public Access on. Once the CloudFront check is green, disable S3 static website hosting: the website endpoint is no longer part of the system. Record the CloudFront domain as <code>CLOUDFRONT_URL</code> in <code>pipeline.yml</code>, then change the deploy job’s final live check to:</p>
+<pre><code>- run: curl --fail --silent --show-error "$CLOUDFRONT_URL" | grep --fixed-strings "Deployed by GitHub Actions"</code></pre>
+    <p>Open a small PR and merge through the existing ruleset. On the post-merge run, deploy the same <code>site</code> artifact, invalidate <code>/*</code>, then run the CloudFront curl check. The invalidation command needs the distribution ID and caller reference, which must be unique per request:</p>
+<pre><code>aws cloudfront create-invalidation \
+  --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+  --paths '/*' \
+  --caller-reference "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"</code></pre>
+    <div class="expect">The CloudFront HTTPS URL returns the expected phrase. The direct object URL such as <code>https://BUCKET.s3.REGION.amazonaws.com/index.html</code> returns 403 AccessDenied. The Actions run still uploads only the <code>site</code> artifact; it has not rebuilt the site or given CloudFront write access.</div>
+    <details><summary>Cutover checklist</summary>
+      <ol>
+        <li>Distribution origin is the normal bucket REST origin; Default root object is <code>index.html</code>.</li>
+        <li>Viewer policy redirects HTTP to HTTPS; OAC is S3 type with Sign requests enabled.</li>
+        <li>Bucket Block Public Access remains enabled; no <code>Principal: "*"</code> allow statement remains.</li>
+        <li>After the CloudFront check is green, S3 static website hosting is disabled.</li>
+        <li>Bucket policy principal is <code>cloudfront.amazonaws.com</code> and its SourceArn contains the exact account and distribution IDs.</li>
+        <li><code>pipeline.yml</code> verifies the CloudFront URL after sync and invalidation; the old S3 website endpoint is removed from the health check too.</li>
+        <li>Direct S3 returns 403; CloudFront returns 200 and the expected phrase.</li>
+      </ol>
+      <p>If CloudFront returns 403, first check the origin is not the website endpoint, the distribution has fully deployed, and the policy's distribution ID/account ID exactly match. Do not “fix” it by reopening public read.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <span class="exercise-label">Design question — decide, then defend</span>
+    <p>Your site now has an un-hashed <code>app.js</code> whose contents change on every release. Choose one release policy for now: (A) one-year cache TTL with a <code>/*</code> invalidation on each deploy, or (B) a five-minute TTL and no invalidations. State which failure users can see after a release or rollback, and name the cost you accept.</p>
+    <details><summary>Model answer and rubric</summary>
+      <p><strong>Choose A for this small, release-driven site.</strong> A long TTL keeps repeat reads fast and inexpensive, while the deployment invalidation makes the new or restored release visible promptly. The accepted costs are invalidation operations, propagation delay while the invalidation completes, and a pipeline step that can fail separately from S3 sync. Without a completed invalidation, users may receive the cached prior version.</p>
+      <p>B is defensible when minimizing release operations matters more than prompt freshness, but after a release or rollback users can receive the prior <code>app.js</code> for up to five minutes. Its accepted cost is bounded staleness and more origin/cache-miss traffic. Full credit requires a choice, the stale-content failure mode, and a concrete latency/cost/operational tradeoff. The long-term improvement is content-hashed asset names with long immutable caching; that is deliberately deferred until release hardening.</p>
+    </details>
+  </div>
+
+  <div class="ask-agent">Bring the exact origin domain, CloudFront distribution ID, bucket-policy statement, HTTP status from both URLs, and invalidation status if the cutover fails. Do not resolve a 403 by making the bucket public. After the ADR and red/green direct-origin proof are complete, <a href="0012-approval-gated-keyless-deploys.html">lesson 12</a> moves the production deploy to GitHub Environments and replaces the temporary IAM-user key with OIDC.</div>
+</main>
+<script src="../assets/quiz.js"></script>
