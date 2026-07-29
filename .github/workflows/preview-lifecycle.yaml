@@ -1,0 +1,114 @@
+name: Preview lifecycle
+
+on:
+  workflow_run:
+    workflows: [Pipeline, Preview cleanup request]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.name == 'Pipeline' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].number != null
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: ${{ vars.DEV_BASE_URL }}/previews/pr-${{ github.event.workflow_run.pull_requests[0].number }}/index.html
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      DEV_BUCKET: ${{ vars.DEV_S3_BUCKET }}
+      DEV_BASE_URL: ${{ vars.DEV_BASE_URL }}
+      PREVIEW_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+    steps:
+      - name: Derive a safe preview target
+        shell: bash
+        run: |
+          [[ "$PREVIEW_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          echo "PREVIEW_PREFIX=previews/pr-$PREVIEW_NUMBER" >> "$GITHUB_ENV"
+          echo "PREVIEW_URL=${DEV_BASE_URL%/}/previews/pr-$PREVIEW_NUMBER/index.html" >> "$GITHUB_ENV"
+
+      - name: Download the successful CI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: build
+          path: ${{ runner.temp }}/site
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate artifact as data
+        run: |
+          test -f "$RUNNER_TEMP/site/index.html"
+          grep -F "Deployed by GitHub Actions" "$RUNNER_TEMP/site/index.html"
+
+      - name: Configure temporary dev credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          role-session-name: preview-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Replace only this PR preview
+        run: aws s3 sync "$RUNNER_TEMP/site/" "s3://$DEV_BUCKET/$PREVIEW_PREFIX/" --delete
+
+      - name: Verify the preview
+        run: |
+          curl --fail --retry 8 --retry-delay 2 "$PREVIEW_URL" |
+            grep -F "Deployed by GitHub Actions"
+
+  cleanup:
+    if: >-
+      github.event.workflow_run.name == 'Preview cleanup request' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].number != null
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEV_BUCKET: ${{ vars.DEV_S3_BUCKET }}
+      DEV_BASE_URL: ${{ vars.DEV_BASE_URL }}
+      PREVIEW_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+    steps:
+      - name: Derive a safe preview target
+        shell: bash
+        run: |
+          [[ "$PREVIEW_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          echo "PREVIEW_PREFIX=previews/pr-$PREVIEW_NUMBER" >> "$GITHUB_ENV"
+          echo "PREVIEW_URL=${DEV_BASE_URL%/}/previews/pr-$PREVIEW_NUMBER/index.html" >> "$GITHUB_ENV"
+
+      - name: Configure temporary dev credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          role-session-name: preview-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Remove only this PR preview
+        run: aws s3 rm "s3://$DEV_BUCKET/$PREVIEW_PREFIX/" --recursive
+
+      - name: Prove the prefix is empty
+        run: |
+          KEY_COUNT="$(aws s3api list-objects-v2 \
+            --bucket "$DEV_BUCKET" \
+            --prefix "$PREVIEW_PREFIX/" \
+            --query KeyCount \
+            --output text)"
+          test "$KEY_COUNT" = 0
+
+      - name: Prove the URL is gone
+        run: |
+          STATUS="$(curl --silent --output /dev/null --write-out '%{http_code}' "$PREVIEW_URL")"
+          test "$STATUS" = 403 -o "$STATUS" = 404
