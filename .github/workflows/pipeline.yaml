@@ -54,8 +54,7 @@ jobs:
         run: |
           aws cloudfront create-invalidation \
             --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-            --paths '/*' \
-            --caller-reference "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            --paths "/*"
 
       - name: Report deployment
         uses: ./.github/actions/deploy-summary
