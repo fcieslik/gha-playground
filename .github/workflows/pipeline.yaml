@@ -21,37 +21,16 @@ env:
   SITE_URL: d26gkersxsxx1f.cloudfront.net
 
 jobs:
-  checks:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run format:check
-  build:
-    needs: checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - uses: actions/upload-artifact@v7
-        with:
-          name: build
-          path: dist
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yaml
+
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [build]
+    needs: [ci]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v8
         with:
           name: build
@@ -70,14 +49,10 @@ jobs:
       - name: Deploy tested artifact
         run: aws s3 sync dist/ "s3://$S3_BUCKET/" --delete
 
-      - name: Report
-        env:
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
-        run: |
-          {
-            echo "### AWS S3 bucket deploy"
-            echo "- **Commit:** ${{ github.sha }}"
-            echo "- **Message:** $COMMIT_MSG"
-            echo "- **Deployed to:** $SITE_URL"
-            echo "- **Files in dist/:** $(find dist -type f | wc -l)"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report deployment
+        uses: ./.github/actions/deploy-summary
+        with:
+          commit-sha: ${{ github.sha }}
+          commit-message: ${{ github.event.head_commit.message || 'No commit message' }}
+          site-directory: dist
+          target: ${{ env.SITE_URL }}

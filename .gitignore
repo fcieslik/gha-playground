@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# act (local GitHub Actions) secrets
+.secrets
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

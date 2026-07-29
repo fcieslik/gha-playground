@@ -15,4 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "reviewing ${{ github.event.pull_request.title}}"
+      - env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: echo "reviewing $PR_TITLE"

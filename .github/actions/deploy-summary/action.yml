@@ -1,0 +1,36 @@
+name: Deploy summary
+description: Write one deployment report to the run summary.
+
+inputs:
+  commit-sha:
+    description: Commit that produced the deployed artifact
+    required: true
+  commit-message:
+    description: Human-authored commit message
+    required: true
+  site-directory:
+    description: Directory containing the downloaded site
+    required: true
+  target:
+    description: Deployment target shown to the reader
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Write deployment summary
+      shell: bash
+      env:
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        SITE_DIRECTORY: ${{ inputs.site-directory }}
+        DEPLOY_TARGET: ${{ inputs.target }}
+      run: |
+        FILE_COUNT="$(find "$SITE_DIRECTORY" -type f | wc -l | tr -d ' ')"
+        {
+          echo "### S3 deploy"
+          echo "- **Commit:** $COMMIT_SHA"
+          echo "- **Message:** $COMMIT_MESSAGE"
+          echo "- **Files:** $FILE_COUNT"
+          echo "- **Target:** $DEPLOY_TARGET"
+        } >> "$GITHUB_STEP_SUMMARY"

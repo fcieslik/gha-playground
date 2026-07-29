@@ -1,0 +1,339 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 10: Reusable &amp; Enforced CI</title>
+<link rel="stylesheet" href="../assets/course.css">
+<main>
+  <h1>Reusable &amp; Enforced CI</h1>
+  <p class="lesson-meta">Combined lessons 10–12 · ~90–120 min · reuse one step, reuse the CI graph, then make its stable result a merge requirement</p>
+  <p class="lesson-meta">Prerequisite: <a href="0009-caching-local-runs-and-debugging.html">lesson 9</a> complete and a green <code>pipeline.yml</code>: PRs build/test, post-merge pushes build/test/deploy, the <code>site</code> artifact reaches S3, and both Node setup steps use the npm cache without skipping <code>npm ci</code>.</p>
+
+  <p>Your pipeline works, but its structure is still only a convention. The deploy summary is shell code embedded in one job; the complete CI contract is embedded in one event-facing workflow; and GitHub still lets a human merge while CI is red. You will strengthen those three seams in order: package a repeated <strong>step</strong> as a composite action, package the <strong>jobs</strong> as a reusable workflow, then make one stable result a repository rule.</p>
+
+  <p>This is one longer session because the pieces explain one another. Reuse without enforcement is optional convention. Enforcement against unstable matrix names is brittle. A stable gate without real jobs behind it is theatre. The completed path is:</p>
+
+<pre><code>pull_request
+    │
+    ▼
+pipeline.yml
+    │ calls
+    ▼
+ci.yml ── build ──► site artifact
+    ├──── test (Node 22/24/26)
+    └──── required ◄── both results
+              │
+              ▼
+       ruleset requires
+        ci / required</code></pre>
+
+  <div class="primary-source">
+    <a href="https://frontendmasters.com/courses/github-actions/">Frontend Masters: Cloud CI/CD with GitHub Actions</a> — watch <strong>Composite Actions</strong>, <strong>Benefits of Reusable Workflows</strong>, <strong>Adding Reusable Workflows</strong>, and <strong>Configure Branch Protection</strong> (02:27:27–03:14:46). GitHub's <a href="https://docs.github.com/en/actions/tutorials/create-actions/create-a-composite-action">composite-action tutorial</a>, <a href="https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows">reusable-workflow guide</a>, and <a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets">ruleset reference</a> are authoritative. Keep the <a href="../reference/reusable-and-enforced-ci.html">reuse &amp; enforcement reference sheet</a> open.
+  </div>
+
+  <h2>Choose the reuse boundary by what must move</h2>
+  <table>
+    <thead>
+      <tr><th>Need</th><th>Smallest fitting tool</th><th>Invocation boundary</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>A few repeated commands inside a job</td><td>Composite action</td><td>A step: <code>steps[*].uses</code></td></tr>
+      <tr><td>One or more jobs, including runners, matrices, permissions, or dependencies</td><td>Reusable workflow</td><td>A job: <code>jobs.&lt;id&gt;.uses</code></td></tr>
+      <tr><td>A small repeated YAML fragment with no meaningful interface</td><td>Leave it inline; an anchor may be enough</td><td>No new component</td></tr>
+      <tr><td>A result that must block merging</td><td>Ruleset with a required status check</td><td>Repository policy, outside workflow YAML</td></tr>
+    </tbody>
+  </table>
+
+  <p>The important distinction is not file extension. A composite action cannot declare a runner, matrix, job-level permissions, or <code>needs</code>; it executes as steps inside its caller's runner. A reusable workflow owns complete jobs and is called where a job would normally be declared. A ruleset does not run CI at all—it turns a reported check result into a merge constraint.</p>
+
+  <h2>Part A — extract the deploy summary into a composite action</h2>
+  <p>Create <code>.github/actions/deploy-summary/action.yml</code>. An action directory needs an <code>action.yml</code> metadata file with a name, description, inputs, and <code>runs.using: composite</code>. Every composite <code>run:</code> step also declares its shell because the action, unlike a workflow job, does not own a runner default:</p>
+
+<pre><code>name: Deploy summary
+description: Write one deployment report to the run summary
+
+inputs:
+  commit-sha:
+    description: Commit that produced the deployed artifact
+    required: true
+  commit-message:
+    description: Human-authored commit message
+    required: true
+  site-directory:
+    description: Directory containing the downloaded site
+    required: true
+  target:
+    description: Deployment target shown to the reader
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Write deployment summary
+      shell: bash
+      env:
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        SITE_DIRECTORY: ${{ inputs.site-directory }}
+        DEPLOY_TARGET: ${{ inputs.target }}
+      run: |
+        FILE_COUNT="$(find "$SITE_DIRECTORY" -type f | wc -l | tr -d ' ')"
+        {
+          echo "### S3 deploy"
+          echo "- **Commit:** $COMMIT_SHA"
+          echo "- **Message:** $COMMIT_MESSAGE"
+          echo "- **Files:** $FILE_COUNT"
+          echo "- **Target:** $DEPLOY_TARGET"
+        } &gt;&gt; "$GITHUB_STEP_SUMMARY"</code></pre>
+
+  <p>The inputs are the action's interface. The action does not reach into <code>github.event</code>, guess a bucket, or assume <code>dist/</code>; the caller supplies those decisions. The human-authored commit message crosses the same trust boundary as in lesson 4, so it is first assigned to <code>env</code> and then expanded as a quoted shell variable. Expression interpolation never pastes it directly into executable script text.</p>
+
+  <p>Use the local action in the deploy job:</p>
+
+<pre><code>      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: site
+          path: dist/
+
+      # configure credentials, deploy, and verify as before
+
+      - name: Report deployment
+        uses: ./.github/actions/deploy-summary
+        with:
+          commit-sha: ${{ github.sha }}
+          commit-message: ${{ github.event.head_commit.message }}
+          site-directory: dist
+          target: ${{ env.SITE_URL }}</code></pre>
+
+  <p>This checkout is newly necessary. GitHub resolves <code>uses: ./...</code> against files in the job's workspace, and every job starts empty. Put checkout before the local action (and before the artifact download for a predictable clean workspace). A Marketplace action can be downloaded by the runner service; your repository-local action must first exist on disk.</p>
+
+  <p class="aside"><strong>Versioning consequence:</strong> <code>./.github/actions/deploy-summary</code> uses the action from the same checked-out commit as the caller. That gives atomic changes inside one repo, but it is not cross-repository reuse. A shared action would use <code>owner/repo/path@ref</code>; a commit SHA is the strongest immutable ref, at the cost of explicit upgrades.</p>
+
+  <h2>Part B — lift CI into a reusable workflow</h2>
+  <p>The build and matrix are not one step-shaped unit: they own runners, parallel jobs, a matrix, caches, and the <code>site</code> artifact. Put them in <code>.github/workflows/ci.yml</code> and expose the special <code>workflow_call</code> event:</p>
+
+<pre><code>name: Reusable CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # checkout, Node 24 + npm cache, npm ci, build, upload site
+
+  test:
+    # matrix Node 22/24/26, npm cache, npm ci, build
+
+  required:
+    name: required
+    if: always()
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$TEST_RESULT" = success</code></pre>
+
+  <p>The event-facing <code>pipeline.yml</code> keeps lifecycle and deployment policy, but replaces its inline <code>build</code> and <code>test</code> jobs with a call:</p>
+
+<pre><code>jobs:
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: ci
+    runs-on: ubuntu-latest
+    # existing S3 steps follow</code></pre>
+
+  <p>A reusable workflow is called as a <strong>job</strong>, so the calling job does not also have <code>runs-on</code> or <code>steps</code>. The called jobs still run inside the caller's workflow run. That is why <code>build</code> can upload <code>site</code> and the later caller-side deploy job can download the same artifact—no cross-run transfer was introduced.</p>
+
+  <p>The local reusable-workflow path also needs no checkout in the calling job. GitHub loads workflow definitions before runners start, and <code>./.github/workflows/ci.yml</code> means the file at the caller commit. Checkout is still present <em>inside</em> <code>build</code> and <code>test</code> because those jobs read application files.</p>
+
+  <h2>Why the extra <code>required</code> job exists</h2>
+  <p>Do not require every matrix check individually. Matrix display names change when supported Node versions change, and a downstream job normally becomes <em>skipped</em> when an upstream job fails. GitHub warns that a skipped dependent job may fail to report the blocking result you intended.</p>
+
+  <p>The gate uses <code>if: always()</code>, reads both aggregate job results through <code>needs</code>, and exits nonzero unless both equal <code>success</code>. The check name is stable even if the matrix changes. For a reusable workflow, GitHub formats it as:</p>
+
+<pre><code>&lt;caller job name&gt; / &lt;called job name&gt;
+
+ci / required</code></pre>
+
+  <p>Treat that name as a public interface. Renaming caller job <code>ci</code> or called job <code>required</code> without updating the ruleset leaves GitHub waiting for a check that no workflow reports. Required checks do not know about workflow filenames, trigger types, or matrices; they match reported names.</p>
+
+  <h2>Part C — turn the result into a merge gate</h2>
+  <p>First run the new workflow successfully on a PR so GitHub has observed <code>ci / required</code>. Then create a repository ruleset:</p>
+
+  <ol>
+    <li>Repository <strong>Settings → Rules → Rulesets → New ruleset → New branch ruleset</strong>.</li>
+    <li>Name it <code>protect-main</code>, set enforcement to <strong>Active</strong>, and target the default branch.</li>
+    <li>Enable <strong>Require a pull request before merging</strong>. In a solo playground, keep required approvals at 0; the point today is CI enforcement, not pretending you can independently review yourself.</li>
+    <li>Enable <strong>Require status checks to pass</strong> and add the exact check <code>ci / required</code>. Select GitHub Actions as the expected source if the UI offers it.</li>
+    <li>Enable <strong>Require branches to be up to date before merging</strong> for strict checking, then create the ruleset without a bypass actor.</li>
+  </ol>
+
+  <p>Strict mode tests the proposed change against current <code>main</code>; if <code>main</code> advances, the branch must update and CI runs again. That costs more time and Actions minutes than loose mode, but it catches integration failures before merge. A low-risk, high-throughput repository may deliberately choose loose mode. The important part is to make the tradeoff explicit, not inherit a checkbox accidentally.</p>
+
+  <p class="aside"><strong>Avoid a permanent Pending state.</strong> Do not add <code>paths:</code> filtering to a workflow that reports a required check: when the whole workflow is filtered out, no result arrives and merging waits forever. A job skipped by an <code>if</code> reports success; an entire required workflow skipped by a filter or skip instruction does not. If you later enable merge queue, add the <code>merge_group</code> trigger so the required check is produced there too.</p>
+
+  <h2>Check yourself</h2>
+
+  <div class="quiz" data-quiz='{"q":"Which unit can own a runner and a matrix?","options":["A reusable workflow","A composite action","A repository ruleset"],"answer":0,"why":"A reusable workflow contains complete jobs, so it can declare runners, matrices, dependencies, and permissions. A composite action is invoked inside one existing job."}'></div>
+
+  <div class="quiz" data-quiz='{"q":"Why does the deploy job now need checkout?","options":["The local composite action must exist in the workspace","The downloaded artifact contains Git metadata","AWS credentials require a checked-out branch"],"answer":0,"why":"A relative uses: ./ path resolves on the job workspace. Checkout materializes the repository-local action; artifact download and AWS authentication do not do that."}'></div>
+
+  <div class="quiz" data-quiz='{"q":"Where is a reusable workflow invoked?","options":["As a job with jobs.&lt;id&gt;.uses","As a shell command inside run","As an input under workflow_dispatch"],"answer":0,"why":"A reusable workflow owns jobs and is called where a job is declared. Its caller job cannot also declare runs-on or steps."}'></div>
+
+  <div class="quiz" data-quiz='{"q":"Why does the required job use always()?","options":["It must evaluate upstream results even after a failure","It must bypass every repository rule","It must rerun successful matrix entries twice"],"answer":0,"why":"Without always(), a failed dependency skips the gate. The gate must run, inspect needs.*.result, and report an explicit failure that the ruleset can require."}'></div>
+
+  <div class="quiz" data-quiz='{"q":"Which check should the ruleset require?","options":["ci / required","every current Node matrix display name","the pipeline.yml filename"],"answer":0,"why":"GitHub names reusable-workflow checks as caller job / called job. The explicit gate is stable across matrix changes; filenames are not status checks."}'></div>
+
+  <div class="quiz" data-quiz='{"q":"What is the main cost of strict required checks?","options":["A branch may need updating and CI rerunning after main changes","GitHub skips all checks after the first green run","Deploy credentials become available to pull requests"],"answer":0,"why":"Strict mode proves the change against current main, so base-branch movement can require another integration and CI run. It does not change credential exposure."}'></div>
+
+  <h2>Do it for real</h2>
+  <p>Use two small PRs so each abstraction earns its place and can be observed. Write every file from scratch; the reference sheet is fair game.</p>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 1 — extract and execute one composite action</span>
+    <p>Create <code>.github/actions/deploy-summary/action.yml</code> with the four inputs shown above and one Bash step that writes the S3 heading, commit, message, file count, and target to <code>$GITHUB_STEP_SUMMARY</code>. In <code>pipeline.yml</code>, replace only the inline Report step:</p>
+    <ol>
+      <li>checkout the repository before any <code>uses: ./...</code> step;</li>
+      <li>keep artifact download, content verification, AWS authentication, sync, and live verification unchanged;</li>
+      <li>call <code>./.github/actions/deploy-summary</code> and supply every input explicitly;</li>
+      <li>keep the commit message on the safe expression → <code>env</code> → quoted-shell-variable path inside the action.</li>
+    </ol>
+    <p>Run <code>actionlint</code>, open a PR, and confirm deploy is still skipped. Merge it, then inspect the post-merge push run and its summary.</p>
+    <div class="expect">The PR CI stays green without AWS access. The push run deploys the same <code>site</code> artifact and renders the same information through one step named <em>Report deployment</em>. Opening that step reveals the nested composite step. No caller-specific value is hard-coded inside the action.</div>
+    <details><summary>Stuck? Reveal the action and caller</summary>
+      <p>Use the complete <code>action.yml</code> from Part A. The relevant start and end of the deploy step list become:</p>
+<pre><code>    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: site
+          path: dist/
+
+      # verify artifact, configure AWS, sync, and verify live site unchanged
+
+      - name: Report deployment
+        uses: ./.github/actions/deploy-summary
+        with:
+          commit-sha: ${{ github.sha }}
+          commit-message: ${{ github.event.head_commit.message }}
+          site-directory: dist
+          target: ${{ env.SITE_URL }}</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 2 — extract CI and build a stable gate</span>
+    <p>On a new branch, create <code>.github/workflows/ci.yml</code> with <code>workflow_call</code>. Move—not copy—the current <code>build</code> and <code>test</code> jobs into it. Preserve every behavior from lesson 9: Node 24 build, Node 22/24/26 matrix, <code>cache: npm</code>, unconditional <code>npm ci</code>, real builds, and one uploaded <code>site</code> artifact.</p>
+    <p>Add the <code>required</code> job from Part B. Then replace the two caller jobs in <code>pipeline.yml</code> with the local reusable-workflow call and change deploy to <code>needs: ci</code>. Do not move triggers, AWS configuration, secrets, or deployment into reusable CI.</p>
+    <p>Run <code>actionlint</code> against both files, open a PR, and inspect the nested graph and exact check names.</p>
+    <div class="expect">The PR shows build, three matrix executions, and <code>ci / required</code>; deploy stays skipped. The build still uploads exactly one artifact named <code>site</code>. After merge, caller-side deploy downloads that artifact in the same run and the local composite action reports it.</div>
+    <details><summary>Stuck? Reveal a working ci.yml and caller seam</summary>
+<pre><code>name: Reusable CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: site
+          path: dist/
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  required:
+    name: required
+    if: always()
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$TEST_RESULT" = success</code></pre>
+<pre><code>jobs:
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: ci
+    runs-on: ubuntu-latest
+    # keep every deploy step from Exercise 1</code></pre>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 3 — prove the repository rejects red CI</span>
+    <p>After one green PR run has reported <code>ci / required</code>, create the active <code>protect-main</code> ruleset exactly as described in Part C. Keep the current PR open for the experiment:</p>
+    <ol>
+      <li>temporarily change the build job's <code>npm ci</code> to <code>nmp ci</code> and push;</li>
+      <li>observe the build failure, the still-executed red <code>ci / required</code>, and the disabled merge path;</li>
+      <li>restore <code>npm ci</code>, push, and verify the latest SHA turns the required check green;</li>
+      <li>merge through the PR—do not bypass the rule—and inspect the post-merge deployment.</li>
+    </ol>
+    <div class="expect">The deliberate typo cannot merge even though you own the repository. The gate is red rather than skipped. After the fix, strict CI passes on the latest SHA, merge becomes available, and the push run deploys. The final default branch contains no typo and the ruleset remains active.</div>
+    <details><summary>Stuck? Reveal the ruleset checklist</summary>
+      <ul>
+        <li><strong>Name:</strong> <code>protect-main</code>; <strong>enforcement:</strong> Active; <strong>target:</strong> default branch.</li>
+        <li><strong>Bypass list:</strong> empty.</li>
+        <li><strong>Require a pull request:</strong> enabled; required approvals 0 for this solo exercise.</li>
+        <li><strong>Require status checks:</strong> enabled; exact check <code>ci / required</code>; expected source GitHub Actions when selectable.</li>
+        <li><strong>Require branches to be up to date:</strong> enabled.</li>
+      </ul>
+      <p>If the check is not selectable, confirm the latest PR run actually contains a green job labeled <code>ci / required</code>. If the gate is gray after the typo, confirm the called <code>required</code> job has both <code>needs: [build, test]</code> and <code>if: always()</code>. Do not solve either problem by adding a bypass.</p>
+    </details>
+  </div>
+
+  <div class="exercise">
+    <span class="exercise-label">Design question — decide, then defend</span>
+    <p>Eight repositories now need the same Node build-and-test policy, but each has a different deployment. A teammate proposes copying <code>ci.yml</code> into all eight repos because a central workflow creates coupling. Choose copying or a shared reusable workflow, state what remains local, and name the tradeoff you accept.</p>
+    <details><summary>Model answer and rubric</summary>
+      <p><strong>Choose a shared reusable CI workflow pinned by each caller to an immutable commit SHA; keep repository-specific triggers and deployment in each caller.</strong> The cohesive shared unit is the build/test policy—Node versions, reproducible install, cache, artifact contract, and stable gate—while deployment targets and credentials vary and should remain local. Copying removes runtime dependency on a central repository but creates eight drifting policy copies; central reuse makes fixes and security policy reviewable in one place. Tradeoff accepted: consumers are coupled to the shared workflow's interface and need an explicit, tested SHA-upgrade process, so central changes do not reach every repo instantly. Full credit for (a) choosing a boundary that matches whole jobs, (b) leaving repo-specific deployment local, and (c) naming either centralized coupling/version rollout cost or copied-policy drift. A composite action alone is incomplete because this reusable unit owns runners, a matrix, jobs, and an artifact.</p>
+    </details>
+  </div>
+
+  <div class="ask-agent">Ask your teacher about a local action that cannot be found, <code>shell:</code> validation, a reusable workflow call rejected beside <code>runs-on</code>, an artifact missing in deploy, a gate that was skipped, or a ruleset waiting forever for the wrong check name. Bring the exact YAML boundary and check name. When the red/green merge experiment works, report back: the combined <strong>lessons 13–14</strong> first decide the private S3 + CloudFront architecture in ADR-002, then implement it with Origin Access Control.</div>
+</main>
+<script src="../assets/quiz.js"></script>
