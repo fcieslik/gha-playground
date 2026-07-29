@@ -1,0 +1,243 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 14: Production Release Hardening</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  table { border-collapse: collapse; width: 100%; font-size: 0.95em; }
+  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-variant: small-caps; font-weight: 400; color: var(--muted); }
+  .release-map { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.1rem; overflow-x: auto; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.82em; line-height: 1.4; white-space: pre; }
+  .danger { border-left: 3px solid var(--accent); padding-left: 1rem; }
+</style>
+<main>
+  <h1>Production Release Hardening</h1>
+  <p class="lesson-meta">Lesson 14 · planned lesson 18 · ~90–120 min · make freshness, action code, and overlapping production releases deterministic</p>
+  <p class="lesson-meta">Prerequisite: <a href="0012-approval-gated-keyless-deploys.html">lesson 12</a> complete: production is private behind CloudFront, requires Environment approval, and deploys through OIDC. Lesson 13’s previews may remain on their separate cache policy.</p>
+
+  <p>A green upload is not yet a trustworthy release. Users can still receive an old edge copy, a movable action tag can execute different code tomorrow, and two approved runs can mutate the same bucket at once. Today you will turn those three implicit risks into one explicit release contract.</p>
+
+  <div class="release-map">immutable CI artifact
+        │
+        ▼
+production concurrency group ── one mutating deploy at a time
+        │
+        ▼
+approved production Environment ── OIDC role
+        │
+        ├── upload HTML: revalidate on every request
+        ├── upload fingerprinted assets: cache for one year
+        ├── delete stale origin objects
+        ├── invalidate /index.html and wait
+        └── verify metadata + live content
+
+every remote action ── full commit SHA + readable release comment</div>
+
+  <p>The contract is deliberately asymmetric. A mutable entry point such as <code>index.html</code> must discover the current release quickly. An asset may be cached for a year only when its URL changes with its bytes, for example <code>app.3f2a8c91.js</code>. Concurrency then ensures that one complete artifact converges the origin before another release may start.</p>
+
+  <div class="primary-source">
+    Watch Frontend Masters’ <a href="https://frontendmasters.com/courses/github-actions/"><strong>Pinning Workflows to SHAs</strong> and <strong>Managing Concurrency</strong></a> sections (04:04:47–04:18:01). GitHub’s current <a href="https://docs.github.com/en/actions/reference/security/secure-use">secure-use reference</a> and <a href="https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency">concurrency reference</a> are authoritative. For the delivery half, keep the <a href="../reference/production-release-contract.html">production release contract</a> open beside AWS’s <a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Expiration.html">cache-expiration guide</a>.
+  </div>
+
+  <h2>Checkpoint 1 — classify URLs before setting TTLs</h2>
+
+  <table>
+    <thead><tr><th>Class</th><th>Example</th><th>Policy</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td>Mutable entry point</td><td><code>index.html</code></td><td><code>public,max-age=0,s-maxage=0,must-revalidate</code></td><td>The same URL may contain a new release.</td></tr>
+      <tr><td>Immutable asset</td><td><code>assets/app.3f2a8c91.js</code></td><td><code>public,max-age=31536000,immutable</code></td><td>Changed bytes produce a changed URL.</td></tr>
+      <tr><td>Unfingerprinted asset</td><td><code>assets/app.js</code></td><td>Short TTL; never <code>immutable</code></td><td>The URL can lie about which bytes it names.</td></tr>
+    </tbody>
+  </table>
+
+  <p>CloudFront and browsers are separate caches. AWS documents that <code>s-maxage</code> controls the shared CloudFront cache while <code>max-age</code> controls browsers, bounded by the cache behavior’s minimum and maximum TTL. Keep the production behavior on <strong>CachingOptimized</strong>; origin headers may shorten its default TTL, while fingerprinted assets retain the long policy.</p>
+
+  <p class="danger"><strong>A long TTL requires a content-derived filename.</strong> A version written by hand, a run number, or a date can still be reused accidentally. If the current build emits only <code>index.html</code>, apply only the HTML policy today. Add the immutable upload only after the build artifact contains fingerprinted paths.</p>
+
+  <div class="quiz" data-quiz='{"q":"Which file may safely keep a one-year immutable TTL?","options":["A script named from its content hash","A script retaining its one mutable pathname","An index retaining its one mutable pathname"],"answer":0,"why":"The content-derived URL changes whenever the bytes change, so an old cached object still answers its URL truthfully."}'></div>
+
+  <h2>Checkpoint 2 — upload metadata as part of the release</h2>
+
+  <p>S3 stores <code>Cache-Control</code> as object metadata. A plain <code>sync</code> can skip unchanged files, so changing only the desired header does not necessarily rewrite existing metadata. Download the <code>site</code> artifact to <code>${{ runner.temp }}/site</code>, use <code>cp</code> for the two policy classes, then use <code>sync --delete</code> to remove keys absent from the artifact.</p>
+
+<pre><code>- name: Publish release with explicit cache metadata
+  env:
+    SITE_DIR: ${{ runner.temp }}/site
+    PROD_BUCKET: ${{ vars.PROD_S3_BUCKET }}
+  run: |
+    set -euo pipefail
+
+    aws s3 cp "$SITE_DIR/" "s3://$PROD_BUCKET/" \
+      --recursive \
+      --exclude "*" \
+      --include "*.html" \
+      --cache-control "public,max-age=0,s-maxage=0,must-revalidate"
+
+    if test -d "$SITE_DIR/assets"; then
+      if find "$SITE_DIR/assets" -type f |
+        grep -Ev '/[^/]+\.[0-9a-f]{8,}\.[^/]+$'
+      then
+        echo "Every immutable asset needs a content hash in its filename" &gt;&amp;2
+        exit 1
+      fi
+
+      aws s3 cp "$SITE_DIR/assets/" "s3://$PROD_BUCKET/assets/" \
+        --recursive \
+        --cache-control "public,max-age=31536000,immutable"
+    fi
+
+    aws s3 sync "$SITE_DIR/" "s3://$PROD_BUCKET/" --delete</code></pre>
+
+  <p>The validation enforces the naming half of the artifact contract: files under <code>assets/</code> must have at least eight lowercase hexadecimal characters between two dots. The build still owns proving that those characters come from the content. Adjust the check if your build tool emits a different proven content-hash format; do not delete it and keep the one-year TTL.</p>
+
+  <p>Then replace the blanket <code>/*</code> invalidation from <a href="0011-private-cloudfront-delivery.html">lesson 11</a> with the only mutable viewer path. Wait for completion before claiming the release is live.</p>
+
+<pre><code>- name: Revalidate the mutable entry point
+  id: invalidate
+  env:
+    DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+  run: |
+    set -euo pipefail
+    invalidation_id="$(
+      aws cloudfront create-invalidation \
+        --distribution-id "$DISTRIBUTION_ID" \
+        --paths "/index.html" \
+        --query "Invalidation.Id" \
+        --output text
+    )"
+    echo "id=$invalidation_id" &gt;&gt; "$GITHUB_OUTPUT"
+    aws cloudfront wait invalidation-completed \
+      --distribution-id "$DISTRIBUTION_ID" \
+      --id "$invalidation_id"</code></pre>
+
+  <p>With <code>--paths</code>, the AWS CLI generates the unique caller reference. A request for the distribution root returns the configured default root object, <code>index.html</code>, so invalidating that object covers the entry point. Immutable assets need no invalidation: a new release points at new URLs, while older HTML may continue to point at older assets until it revalidates.</p>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 1 — prove the freshness contract</span>
+    <p>Write the publish and targeted-invalidation steps from scratch. If your artifact contains only HTML, omit the asset block but keep its rule in a comment. Run <code>actionlint</code>, merge a visible text change, approve production, and record the invalidation ID.</p>
+    <p>After the waiter completes, inspect both S3 metadata and the viewer response:</p>
+<pre><code>aws s3api head-object \
+  --bucket "$PROD_BUCKET" \
+  --key index.html \
+  --query CacheControl \
+  --output text
+
+curl --fail --silent --show-error --head \
+  "$CLOUDFRONT_URL/index.html" |
+  tr -d '\r' |
+  grep -i '^cache-control:.*max-age=0'
+
+curl --fail --silent --show-error "$CLOUDFRONT_URL/" |
+  grep --fixed-strings "Deployed by GitHub Actions"</code></pre>
+    <div class="expect">S3 and CloudFront both expose a zero-age policy for <code>index.html</code>; the targeted invalidation reaches <code>Completed</code>; the root URL contains the new release marker. No <code>/*</code> invalidation is created.</div>
+    <details><summary>Solution and failure routing</summary>
+      <p>The complete order is: download the existing <code>site</code> artifact, copy HTML with zero-age metadata, validate and copy any fingerprinted assets with immutable metadata, run <code>sync --delete</code>, create <code>/index.html</code> invalidation, wait for its ID, then verify metadata and live content.</p>
+      <ul>
+        <li>Old metadata remains: the workflow still uses only <code>sync</code>; force the policy class through <code>cp --cache-control</code>.</li>
+        <li>CloudFront ignores zero age: inspect the behavior’s minimum TTL and whether it honors origin cache headers.</li>
+        <li>New origin, old viewer response: confirm the invalidation path is exactly <code>/index.html</code> and wait for its ID.</li>
+        <li>Asset validation fails: fingerprint the filename in the build; do not weaken the cache invariant.</li>
+        <li>Live check races: it must run after the invalidation waiter, not merely after the create request.</li>
+      </ul>
+    </details>
+  </div>
+
+  <h2>Checkpoint 3 — pin the code your credentials execute</h2>
+
+  <p>A release tag such as <code>@v7</code> is readable but movable. A full commit SHA is immutable and therefore the only action reference GitHub describes as immutable. Keep the release tag in a same-line comment so reviewers and Dependabot retain the human meaning.</p>
+
+<pre><code>- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+- uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+- uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+- uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+- uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3</code></pre>
+
+  <p>These SHAs resolve the course versions on 29 July 2026. Before committing, independently resolve each reviewed tag with <code>git ls-remote https://github.com/OWNER/REPO.git refs/tags/TAG</code>. Pin every remote action in every workflow, including unprivileged CI: compromised build output later crosses into a credential-bearing deployment.</p>
+
+  <p>Add automated update proposals rather than trading immutability for staleness:</p>
+
+<pre><code># .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly</code></pre>
+
+  <p>Dependabot understands a SHA plus its same-line version comment. It opens a reviewable PR; green CI is evidence of compatibility, not permission to auto-merge code that will run beside deployment credentials.</p>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 2 — make the action supply chain reviewable</span>
+    <p>Search <code>.github/workflows</code> and replace every remote tag with a verified 40-character commit SHA. Leave local actions and local reusable workflows as local paths. Add the Dependabot configuration, run <code>actionlint</code>, then enable the repository setting <strong>Require actions to be pinned to a full-length commit SHA</strong> if your plan exposes it.</p>
+<pre><code>rg -n 'uses: [^./][^ ]+@(v|main|master)' .github/workflows
+rg -n 'uses: [^./][^ ]+@[0-9a-f]{40}( |$)' .github/workflows</code></pre>
+    <div class="expect">The first search returns nothing. The second lists every remote action with a full SHA. CI and the approved OIDC deployment remain green, and future action upgrades arrive as explicit reviewable diffs.</div>
+    <details><summary>Solution and self-check</summary>
+      <p>Use the five resolved SHAs above with their same-line release comments, then configure weekly <code>github-actions</code> Dependabot updates. Do not pin to a shortened SHA, a release tag, or a branch. Confirm that each SHA belongs to the intended upstream repository and release. Full credit also requires an update path: Dependabot or an equivalent reviewed process.</p>
+    </details>
+  </div>
+
+  <h2>Checkpoint 4 — serialize the production mutation</h2>
+
+  <p>Add concurrency to the <em>deploy job</em>, not the whole workflow. PR CI and build jobs may remain parallel; only jobs mutating the shared production bucket and distribution need the lock.</p>
+
+<pre><code>deploy:
+  if: github.event_name == 'push'
+  needs: ci
+  runs-on: ubuntu-latest
+  environment:
+    name: production
+    url: ${{ vars.CLOUDFRONT_URL }}
+  concurrency:
+    group: production-deploy
+    cancel-in-progress: false
+  permissions:
+    contents: read
+    id-token: write
+  steps:
+    # pinned actions → publish → invalidate and wait → verify</code></pre>
+
+  <p><code>environment</code> and <code>concurrency</code> are independent controls. The Environment decides whether a release may start and exposes the OIDC subject; the static concurrency group ensures only one production mutation runs at a time—even if a second workflow later deploys to the same target and uses the same group.</p>
+
+  <p>With the default single pending slot, a third release replaces an older pending release while the current release finishes. That is correct for this full-state static-site deployment: the newest artifact subsumes an intermediate artifact. If every release carries a non-skippable migration or audit step, use GitHub’s current <code>queue: max</code> mode or, preferably, separate that ordered operation from a replaceable site deploy.</p>
+
+  <div class="quiz" data-quiz='{"q":"Where should production concurrency be applied here?","options":["Only on the shared production deploy job","Across every independent pull request test job","Only inside one individual workflow shell command"],"answer":0,"why":"The shared mutation needs serialization; independent CI should retain parallel feedback."}'></div>
+
+  <div class="exercise">
+    <span class="exercise-label">Exercise 3 — force and observe an overlap</span>
+    <p>Temporarily add <code>sleep 60</code> immediately before the publish step. Prepare two already-green PRs with different visible release markers. Merge A, approve its production job, and wait until it reaches the sleep. Then merge B.</p>
+    <p>Inspect both runs before approving anything else. B’s deploy must wait on <code>production-deploy</code>; it must not assume the role or touch S3 while A owns the group. Let A finish, approve B when it becomes eligible, and then remove the temporary sleep through the normal PR path.</p>
+    <div class="expect">At no moment do two jobs execute production AWS commands. A completes its upload, invalidation, waiter, and verification before B begins them. The final URL contains B’s marker, and the workflow history preserves both release outcomes.</div>
+    <details><summary>Solution and failure routing</summary>
+      <p>Both deploy jobs use the exact static group <code>production-deploy</code> with <code>cancel-in-progress: false</code>. A runs every mutating step to completion; only then may B enter the same job and publish the newer full-state artifact.</p>
+      <ul>
+        <li>Both deploys run: their group strings differ, or concurrency was attached to a different job.</li>
+        <li>The older run is canceled mid-upload: <code>cancel-in-progress</code> is true; production mutation must finish.</li>
+        <li>All CI waits: concurrency was placed at workflow level instead of on the deploy job.</li>
+        <li>B publishes before A: inspect whether another workflow targets production without the shared group.</li>
+      </ul>
+    </details>
+  </div>
+
+  <h2>Check yourself</h2>
+
+  <div class="quiz" data-quiz='{"q":"Why wait for invalidation before live verification?","options":["The request only starts asynchronous edge eviction","The request atomically uploads every origin object","The request automatically serializes all production workflows"],"answer":0,"why":"Creating an invalidation does not mean every edge has completed it; the waiter closes that observation gap."}'></div>
+  <div class="quiz" data-quiz='{"q":"What does a full action SHA guarantee?","options":["The referenced action bytes cannot move later","The action has no exploitable security defects","The workflow always receives every repository permission"],"answer":0,"why":"Immutability fixes which reviewed code runs. It does not prove that code is bug-free or grant permissions."}'></div>
+  <div class="quiz" data-quiz='{"q":"Why keep HTML cache life near zero?","options":["Its stable URL selects the current release","Its hashed URL identifies immutable release bytes","Its deletion must preserve every previous release"],"answer":0,"why":"The entry point is mutable and must discover new fingerprinted asset URLs quickly."}'></div>
+  <div class="quiz" data-quiz='{"q":"What is separate from Environment approval?","options":["Concurrency serializing access to production state","Reviewers authorizing one production deployment start","OIDC identifying the approved production workload"],"answer":0,"why":"Approval answers who may start; concurrency answers which mutating job may run now."}'></div>
+
+  <h2>Design question — decide, then defend</h2>
+
+  <div class="exercise">
+    <span class="exercise-label">Invalidate everything or version the expensive paths?</span>
+    <p>Choose (A) keep stable asset names and invalidate <code>/*</code> on every release, or (B) use content-hashed asset names, revalidate only HTML, and invalidate <code>/index.html</code>. Name the operational cost and the freshness consequence of your choice.</p>
+    <details><summary>Model answer and rubric</summary>
+      <p><strong>Choose B.</strong> Immutable asset URLs let browsers and edges cache aggressively without serving incorrect bytes for that URL. The mutable HTML entry point gets zero-age metadata plus a targeted invalidation, so it discovers the new asset graph promptly. Rollback republishes older HTML and invalidates the same entry point; its older hashed assets may safely remain cached.</p>
+      <p>The cost is a stricter build contract: filenames must be content-derived, HTML references must change with them, and old assets need a deliberate retention or cleanup policy. Full credit requires a decision, that build/retention cost, and the distinction between origin convergence, edge invalidation, and browser cache behavior.</p>
+    </details>
+  </div>
+
+  <p class="danger"><strong>Done means you have negative evidence, not only one green run.</strong> Show that no remote action tag remains, an unfingerprinted immutable asset fails validation, two production deploys cannot overlap, the invalidation reaches <code>Completed</code>, and the final live marker belongs to the newest release.</p>
+
+  <div class="ask-agent">Ask your teacher if metadata changes do not reach S3, CloudFront still serves old HTML after a completed invalidation, the SHA policy rejects a local action, Dependabot loses the readable version, or two production jobs overlap. Bring both run URLs, the concurrency group, invalidation ID, <code>head-object</code> CacheControl value, and the first unexpected step. Next: <a href="0015-pi-agent-pr-capstone.html">threat-model and implement the Pi coding-agent capstone</a>.</div>
+</main>
+<script src="../assets/quiz.js"></script>
