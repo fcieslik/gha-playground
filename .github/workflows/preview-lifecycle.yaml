@@ -109,12 +109,15 @@ jobs:
         run: aws s3 rm "s3://$DEV_BUCKET/$PREVIEW_PREFIX/" --recursive
 
       - name: Prove the prefix is empty
+        shell: bash
         run: |
+          # shellcheck disable=SC2016
           KEY_COUNT="$(aws s3api list-objects-v2 \
             --bucket "$DEV_BUCKET" \
             --prefix "$PREVIEW_PREFIX/" \
-            --query KeyCount \
+            --query 'length(Contents || `[]`)' \
             --output text)"
+          echo "Objects remaining under $PREVIEW_PREFIX/: $KEY_COUNT"
           test "$KEY_COUNT" = 0
 
       - name: Prove the URL is gone
