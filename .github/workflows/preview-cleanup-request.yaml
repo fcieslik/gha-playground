@@ -1,0 +1,17 @@
+name: Preview cleanup request
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record lifecycle event
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: echo "Preview cleanup requested for PR $PR_NUMBER"
