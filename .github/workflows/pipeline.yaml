@@ -10,8 +10,10 @@ on:
 permissions:
   contents: read
 
+# Workflow-level: only supersede stale PR runs. Pushes get a per-run group
+# (run_id appended) so two deploys never queue before their deploy job does.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.run_id || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -33,6 +35,11 @@ jobs:
     environment:
       name: production
       url: ${{ vars.CLOUDFRONT_URL }}
+    # Serialize the shared production mutation: one deploy touches S3/CloudFront
+    # at a time. A running deploy must finish (never cancelled mid-upload).
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
