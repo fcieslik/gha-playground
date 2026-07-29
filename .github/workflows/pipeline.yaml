@@ -53,14 +53,51 @@ jobs:
       - name: Show machine identity
         run: aws sts get-caller-identity
 
-      - name: Deploy tested artifact
-        run: aws s3 sync dist/ "s3://$S3_BUCKET/" --delete --exact-timestamps
-
-      - name: Invalidate CloudFront cache
+      - name: Publish release with explicit cache metadata
+        env:
+          SITE_DIR: dist
         run: |
-          aws cloudfront create-invalidation \
+          set -euo pipefail
+
+          # Mutable entry point: same URL, new release -> must revalidate every request.
+          aws s3 cp "$SITE_DIR/" "s3://$S3_BUCKET/" \
+            --recursive \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "public,max-age=0,s-maxage=0,must-revalidate"
+
+          if test -d "$SITE_DIR/assets"; then
+            # Vite fingerprint contract: <name>-<8+ base64 hash>.<ext>. No hash -> no year TTL.
+            if find "$SITE_DIR/assets" -type f |
+              grep -Ev -- '-[0-9A-Za-z_-]{8,}\.[^./]+$'
+            then
+              echo "Every immutable asset needs a content hash in its filename" >&2
+              exit 1
+            fi
+
+            aws s3 cp "$SITE_DIR/assets/" "s3://$S3_BUCKET/assets/" \
+              --recursive \
+              --cache-control "public,max-age=31536000,immutable"
+          fi
+
+          # Remove keys absent from the artifact (delete-only in practice).
+          aws s3 sync "$SITE_DIR/" "s3://$S3_BUCKET/" --delete
+
+      - name: Revalidate the mutable entry point
+        id: invalidate
+        run: |
+          set -euo pipefail
+          invalidation_id="$(
+            aws cloudfront create-invalidation \
+              --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+              --paths "/index.html" \
+              --query "Invalidation.Id" \
+              --output text
+          )"
+          echo "id=$invalidation_id" >> "$GITHUB_OUTPUT"
+          aws cloudfront wait invalidation-completed \
             --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-            --paths "/*"
+            --id "$invalidation_id"
 
       - name: Report deployment
         uses: ./.github/actions/deploy-summary
